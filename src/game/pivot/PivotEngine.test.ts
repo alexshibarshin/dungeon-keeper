@@ -41,6 +41,20 @@ function cellCenter(origin: Point, offset: Point = { x: 0, y: 0 }) {
 }
 
 describe('pivot preparation loop', () => {
+  it('detects drag synergies in both zone directions', () => {
+    const engine = new PivotEngine(987654, () => undefined);
+    const saw = boardTrap(engine, 'saw');
+    const mine = boardTrap(engine, 'mine');
+    const cannon = boardTrap(engine, 'cannon');
+    const tesla = boardTrap(engine, 'tesla');
+    const spikes = boardTrap(engine, 'spikes');
+
+    expect(engine.hasZoneSynergy(saw, mine)).toBe(true);
+    expect(engine.hasZoneSynergy(cannon, tesla)).toBe(true);
+    expect(engine.hasZoneSynergy(tesla, cannon)).toBe(true);
+    expect(engine.hasZoneSynergy(cannon, spikes)).toBe(false);
+  });
+
   it('turns discarded shop batches into stackable free rerolls without inflating paid price', () => {
     const engine = new PivotEngine(314159, () => undefined);
     expect(engine.shop).toHaveLength(3);

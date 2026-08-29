@@ -33,6 +33,43 @@ const dirs: Point[] = [{ x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, 
 const rotatingTurretIds = ['flame', 'icicle', 'cannon'] as const;
 type RotatingTurretId = typeof rotatingTurretIds[number];
 
+function curvedRoutePoints(points: Point[], seed: number) {
+  if (points.length < 2) return points;
+  const result: Point[] = [points[0]], cornerRadius = CELL * .22;
+  for (let index = 1; index < points.length - 1; index++) {
+    const previous = points[index - 1], current = points[index], next = points[index + 1];
+    const inLength = Math.hypot(current.x - previous.x, current.y - previous.y) || 1;
+    const outLength = Math.hypot(next.x - current.x, next.y - current.y) || 1;
+    const before = { x: current.x - (current.x - previous.x) / inLength * cornerRadius, y: current.y - (current.y - previous.y) / inLength * cornerRadius };
+    const after = { x: current.x + (next.x - current.x) / outLength * cornerRadius, y: current.y + (next.y - current.y) / outLength * cornerRadius };
+    result.push(before);
+    for (let step = 1; step <= 4; step++) {
+      const t = step / 4, inverse = 1 - t;
+      result.push({ x: inverse * inverse * before.x + 2 * inverse * t * current.x + t * t * after.x, y: inverse * inverse * before.y + 2 * inverse * t * current.y + t * t * after.y });
+    }
+  }
+  result.push(points.at(-1)!);
+  // A restrained sideways wave keeps long corridors organic too. Endpoints
+  // stay locked to the portal and Heart, while the curve remains inside tiles.
+  return result.map((point, index) => {
+    if (!index || index === result.length - 1) return point;
+    const previous = result[index - 1], next = result[index + 1], length = Math.hypot(next.x - previous.x, next.y - previous.y) || 1;
+    const envelope = Math.sin(index / (result.length - 1) * Math.PI);
+    const bend = Math.sin(index * .72 + seed * 1.91) * 3.5 * envelope;
+    return { x: point.x - (next.y - previous.y) / length * bend, y: point.y + (next.x - previous.x) / length * bend };
+  });
+}
+
+function pointOnRoute(points: Point[], progress: number) {
+  const lengths: number[] = []; let total = 0;
+  for (let index = 1; index < points.length; index++) { total += distance(points[index - 1], points[index]); lengths.push(total); }
+  const target = clamp(progress, 0, 1) * total;
+  let segment = lengths.findIndex(value => value >= target); if (segment < 0) segment = lengths.length - 1;
+  const startLength = segment ? lengths[segment - 1] : 0, span = Math.max(.001, lengths[segment] - startLength), t = (target - startLength) / span;
+  const from = points[segment], to = points[segment + 1];
+  return { x: from.x + (to.x - from.x) * t, y: from.y + (to.y - from.y) * t, angle: Math.atan2(to.y - from.y, to.x - from.x) };
+}
+
 function drawTierStar(g: Graphics, x: number, y: number, radius: number) {
   const points: number[] = [];
   for (let index = 0; index < 10; index++) {
@@ -68,6 +105,7 @@ export class PivotEngine {
   itemLayer = new Container();
   itemFrameLayer = new Graphics();
   tierBadgeLayer = new Graphics();
+  synergyHintLayer = new Container();
   enemyLayer = new Container();
   portalLayer = new Container();
   portalGraphics = new Graphics();
@@ -86,6 +124,7 @@ export class PivotEngine {
   segmentSprites = new Map<string, Sprite>();
   turretBaseSprites = new Map<string, Sprite>();
   turretHeadSprites = new Map<string, Sprite>();
+  synergyArrowSprites = new Map<string, Sprite>();
   enemySprites = new Map<number, Sprite>();
   portalIconSprites = new Map<string, Sprite>();
   portalCountTexts = new Map<number, Text>();
@@ -190,7 +229,7 @@ export class PivotEngine {
     this.app.stage.addChild(this.root);
     // The item-frame layer also paints the shop tray. Keep it below item sprites so
     // the tray never masks the traps it is meant to present.
-    this.root.addChild(this.backgroundLayer, this.terrainLayer, this.fogLayer, this.boardLayer, this.itemFrameLayer, this.itemLayer, this.tierBadgeLayer, this.routeLayer, this.portalLayer, this.enemyLayer, this.fxLayer, this.labelLayer);
+    this.root.addChild(this.backgroundLayer, this.terrainLayer, this.fogLayer, this.boardLayer, this.itemFrameLayer, this.itemLayer, this.tierBadgeLayer, this.routeLayer, this.synergyHintLayer, this.portalLayer, this.enemyLayer, this.fxLayer, this.labelLayer);
     this.itemLayer.sortableChildren = true;
     this.portalLayer.addChild(this.portalGraphics);
     this.app.canvas.addEventListener('pointerdown', this.onPointerDown);
@@ -618,6 +657,14 @@ export class PivotEngine {
   private trapTags(item: TrapItem): TrapTag[] {
     const def = TRAPS[item.trapId];
     return [def.element, ...(def.family ? [def.family] : [])];
+  }
+
+  hasZoneSynergy(source: TrapItem, target: TrapItem) {
+    const sourceZone = TRAPS[source.trapId].zone, targetZone = TRAPS[target.trapId].zone;
+    return !!(
+      (sourceZone && this.trapTags(target).includes(sourceZone.checks))
+      || (targetZone && this.trapTags(source).includes(targetZone.checks))
+    );
   }
 
   zoneCells(item: TrapItem, origin = item.origin) {
@@ -1312,33 +1359,37 @@ export class PivotEngine {
   private drawRoute() {
     const g = this.routeLayer; g.clear();
     if (this.phase !== 'prep') return;
-    const { links: linkTraffic } = this.routeSimulation;
-    for (const link of linkTraffic.values()) {
-      if (link.amount < .011) continue;
-      const from = { x: BOARD_X + (link.from.x + .5) * CELL, y: BOARD_Y + (link.from.y + .5) * CELL };
-      const to = { x: BOARD_X + (link.to.x + .5) * CELL, y: BOARD_Y + (link.to.y + .5) * CELL };
-      const dx = to.x - from.x, dy = to.y - from.y, length = Math.hypot(dx, dy) || 1;
-      const nx = -dy / length, ny = dx / length, ux = dx / length, uy = dy / length;
-      const count = link.amount >= .22 ? 3 : link.amount >= .055 ? 2 : 1;
-      for (let particle = 0; particle < count; particle++) {
-        const speed = .38 + Math.min(.2, Math.sqrt(link.amount) * .18) + particle * .025;
-        const pulse = ((this.elapsed * speed + particle / count + link.from.x * .071 + link.from.y * .043) % 1);
-        const laneOffset = count > 1 ? (particle - (count - 1) / 2) * 10 : 0;
-        const tipX = from.x + dx * pulse + nx * laneOffset, tipY = from.y + dy * pulse + ny * laneOffset;
-        const size = count === 3 ? 13 : count === 2 ? 11 : 9, alpha = this.drag ? .86 : count === 3 ? .8 : count === 2 ? .68 : .54;
-        g.moveTo(tipX + ux * 2, tipY + uy * 2).lineTo(tipX - ux * size + nx * size * .55, tipY - uy * size + ny * size * .55).lineTo(tipX - ux * size - nx * size * .55, tipY - uy * size - ny * size * .55).closePath()
-          .fill({ color: 0x17121d, alpha: alpha * .8 });
-        g.moveTo(tipX, tipY).lineTo(tipX - ux * (size - 2) + nx * (size - 2) * .46, tipY - uy * (size - 2) + ny * (size - 2) * .46).lineTo(tipX - ux * (size - 2) - nx * (size - 2) * .46, tipY - uy * (size - 2) - ny * (size - 2) * .46).closePath()
-          .fill({ color: 0xffd968, alpha: alpha * .9 });
-      }
+    const routes = this.routeSimulation.routes, strongest = Math.max(.001, ...routes.map(route => route.amount));
+    for (let routeIndex = 0; routeIndex < routes.length; routeIndex++) {
+      const route = routes[routeIndex], spawn = this.spawnPoints[route.entranceIndex] ?? route.points[0];
+      const gridPoints = [spawn, ...route.points].map(point => ({ x: BOARD_X + (point.x + .5) * CELL, y: BOARD_Y + (point.y + .5) * CELL }));
+      const points = curvedRoutePoints(gridPoints, routeIndex + route.entranceIndex * 7);
+      const load = Math.sqrt(route.amount / strongest), cycle = 3.2 + routeIndex * .13;
+      const progress = (this.elapsed / cycle + routeIndex * .173 + route.entranceIndex * .11) % 1;
+      const head = pointOnRoute(points, progress), tailProgress = Math.max(0, progress - (.09 + load * .055));
+      const tailSamples = Array.from({ length: 9 }, (_, index) => pointOnRoute(points, tailProgress + (progress - tailProgress) * index / 8));
+      const coreWidth = 1.4 + load * 5.8, alpha = (this.drag ? .95 : .68) * (.24 + load * .76);
+      const drawTrail = (width: number, trailAlpha: number, color: number) => {
+        g.moveTo(tailSamples[0].x, tailSamples[0].y);
+        for (const point of tailSamples.slice(1)) g.lineTo(point.x, point.y);
+        g.stroke({ color, width, alpha: trailAlpha, cap: 'round', join: 'round' });
+      };
+      drawTrail(coreWidth * 3.8, alpha * .09, 0xffc94f);
+      drawTrail(coreWidth * 2.1, alpha * .18, 0xffd45f);
+      drawTrail(coreWidth, alpha * .9, 0xffe27a);
+      const ux = Math.cos(head.angle), uy = Math.sin(head.angle), nx = -uy, ny = ux;
+      const size = 7 + load * 9, half = size * (.42 + load * .08);
+      g.moveTo(head.x + ux * size * .34, head.y + uy * size * .34)
+        .lineTo(head.x - ux * size + nx * half, head.y - uy * size + ny * half)
+        .lineTo(head.x - ux * size - nx * half, head.y - uy * size - ny * half).closePath()
+        .fill({ color: 0xffdf72, alpha }).stroke({ color: 0xfff2b0, width: .7 + load * 1.2, alpha: alpha * .9 });
     }
   }
 
   private drawItems() {
-    const centers = this.itemCenters(), used = new Set<string>(), usedTurretBases = new Set<string>(), usedTurretHeads = new Set<string>();
+    const centers = this.itemCenters(), used = new Set<string>(), usedTurretBases = new Set<string>(), usedTurretHeads = new Set<string>(), usedSynergyArrows = new Set<string>();
     this.itemFrameLayer.clear(); this.tierBadgeLayer.clear();
     const draggedItem = this.drag ? this.items.find(item => item.id === this.drag!.itemId) ?? null : null;
-    const zoneCoverage = draggedItem && this.drag?.boardOrigin ? new Set(this.zoneCells(draggedItem, this.drag.boardOrigin).map(pkey)) : new Set<string>();
     const trayOffset = this.shopSlide * (HEIGHT - SHOP_Y + 24);
     this.itemFrameLayer.roundRect(0, SHOP_Y + trayOffset, WIDTH, HEIGHT - SHOP_Y, 0).fill({ color: 0xd9ae69, alpha: .95 }).stroke({ color: 0x6c452d, width: 4 });
     this.itemFrameLayer.roundRect(20, 1039 + trayOffset, 90, 112, 18).fill({ color: 0x3c2723, alpha: .92 }).stroke({ color: 0xffa64f, width: 4 });
@@ -1421,11 +1472,19 @@ export class PivotEngine {
         const starX = center.x + (star - (stars - 1) / 2) * starGap;
         drawTierStar(this.tierBadgeLayer, starX, starY, starRadius);
       }
-      const zoneMatched = !!(draggedItem && item.id !== draggedItem.id && item.origin && def.shape.some(offset => zoneCoverage.has(`${item.origin!.x + offset.x},${item.origin!.y + offset.y}`)));
-      if (zoneMatched) {
+      const synergyMatched = !!(draggedItem && item.id !== draggedItem.id && item.location === 'board' && item.origin && this.hasZoneSynergy(draggedItem, item));
+      if (synergyMatched) {
         const width = (maxX + 1) * unit, height = (maxY + 1) * unit;
+        const pulse = (Math.sin(this.elapsed * 5.2) + 1) / 2;
         this.itemFrameLayer.roundRect(center.x - width / 2 - 5, center.y - height / 2 - 5, width + 10, height + 10, 14)
-          .stroke({ color: 0x5ef397, width: 5, alpha: .92 });
+          .stroke({ color: 0x5ef397, width: 4 + pulse * 1.5, alpha: .48 + pulse * .34 });
+        if (this.zoneArrowTexture) {
+          let arrow = this.synergyArrowSprites.get(item.id);
+          if (!arrow) { arrow = new Sprite(this.zoneArrowTexture); arrow.anchor.set(.5); this.synergyArrowSprites.set(item.id, arrow); this.synergyHintLayer.addChild(arrow); }
+          const arrowSize = clamp(unit * .48, 32, 42) * (1 + pulse * .07);
+          usedSynergyArrows.add(item.id); arrow.visible = true; arrow.x = center.x + width / 2 - 5; arrow.y = center.y - height / 2 + 5;
+          arrow.width = arrowSize; arrow.height = arrowSize; arrow.alpha = .9 + pulse * .1;
+        }
       }
       if (draggedItem?.id === item.id && item.origin && this.zoneMatchCount(item, this.drag?.boardOrigin ?? undefined) > 0) {
         const width = (maxX + 1) * unit, height = (maxY + 1) * unit;
@@ -1441,6 +1500,7 @@ export class PivotEngine {
     for (const [key, sprite] of this.segmentSprites) if (!used.has(key)) { sprite.destroy(); this.segmentSprites.delete(key); }
     for (const [key, sprite] of this.turretBaseSprites) if (!usedTurretBases.has(key)) { sprite.destroy(); this.turretBaseSprites.delete(key); }
     for (const [key, sprite] of this.turretHeadSprites) if (!usedTurretHeads.has(key)) { sprite.destroy(); this.turretHeadSprites.delete(key); }
+    for (const [key, sprite] of this.synergyArrowSprites) if (!usedSynergyArrows.has(key)) { sprite.destroy(); this.synergyArrowSprites.delete(key); }
     if (this.drag) {
       const source = this.items.find(item => item.id === this.drag!.itemId)!;
       const sourceCenter = centers.get(source.id)!;

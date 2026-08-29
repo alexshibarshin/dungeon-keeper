@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { PERKS, REVEAL_CHUNK_SIZES, TRAPS, buildWavePreview, enemyHpScale, trapActivationOffsets } from './config';
+import { ENEMIES, PERKS, REVEAL_CHUNK_SIZES, TRAPS, buildWavePreview, enemyHpScale, trapActivationOffsets } from './config';
 import { activeEntrances, activeSpawnPoints, buildFlowField, generateDungeon, measurePackingSpace, revealedFloor, revealedMask, simulateTraffic, trafficDestination } from './generator';
 import { AUTHORED_LAYOUTS } from './layouts';
 
@@ -108,6 +108,20 @@ describe('authored floor-only backpack dungeons', () => {
     }
   });
 
+  it('condenses cell traffic into a few complete weighted preview routes per portal', () => {
+    for (let seed = 0; seed < AUTHORED_LAYOUTS.length; seed++) for (let expand = 0; expand <= REVEAL_CHUNK_SIZES.length; expand++) {
+      const stage = generateDungeon(seed), entrances = activeEntrances(stage, expand), { routes } = simulateTraffic(stage, expand);
+      expect(routes.length).toBeGreaterThanOrEqual(entrances.length);
+      expect(routes.length).toBeLessThanOrEqual(entrances.length * 3);
+      for (const route of routes) {
+        expect(route.points[0]).toEqual(entrances[route.entranceIndex]);
+        expect(route.points.length).toBeGreaterThan(1);
+        expect(route.amount).toBeGreaterThan(0);
+        for (let index = 1; index < route.points.length; index++) expect(pointDistance(route.points[index - 1], route.points[index])).toBe(1);
+      }
+    }
+  });
+
   it('has exactly ten floor traps, clear elemental tags, and no wall placement', () => {
     expect(Object.values(TRAPS)).toHaveLength(10);
     expect(Object.values(TRAPS).every(trap => trap.placement === 'floor')).toBe(true);
@@ -158,5 +172,11 @@ describe('authored floor-only backpack dungeons', () => {
   it('keeps opening health unchanged and adds 25% to the previous final-wave health', () => {
     expect(enemyHpScale(1)).toBe(1);
     expect(enemyHpScale(10)).toBeCloseTo(3.15 * 1.25);
+  });
+
+  it('uses the reduced base health budget for every enemy type', () => {
+    expect(Object.fromEntries(Object.entries(ENEMIES).map(([kind, enemy]) => [kind, enemy.hp]))).toEqual({
+      grunt: 68, runner: 46.75, flyer: 97.75, shieldbearer: 187, brute: 340,
+    });
   });
 });

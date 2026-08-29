@@ -18,7 +18,50 @@ const neighbors = (point: Point) => dirs.map(dir => ({ x: point.x + dir.x, y: po
 const manhattan = (a: Point, b: Point) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
 const heartCells = (origin: Point) => [origin, { x: origin.x + 1, y: origin.y }, { x: origin.x, y: origin.y + 1 }, { x: origin.x + 1, y: origin.y + 1 }];
 
-export type TrafficSimulation = { traffic: Map<string, number>; links: Map<string, { from: Point; to: Point; amount: number }> };
+export type TrafficRoute = { entranceIndex: number; amount: number; points: Point[] };
+export type TrafficSimulation = {
+  traffic: Map<string, number>;
+  links: Map<string, { from: Point; to: Point; amount: number }>;
+  /** A few meaningful source-to-Heart paths used by the quiet route preview. */
+  routes: TrafficRoute[];
+};
+
+function representativeTrafficRoutes(plan: FlowPlan, links: TrafficSimulation['links']) {
+  const outgoing = new Map<string, Array<{ from: Point; to: Point; amount: number }>>();
+  for (const link of links.values()) {
+    const list = outgoing.get(key(link.from)) ?? [];
+    list.push(link); outgoing.set(key(link.from), list);
+  }
+  const routes: TrafficRoute[] = [], entranceShare = 1 / Math.max(1, plan.entrances.length);
+  // Three variants per portal are enough to communicate a broad room split,
+  // without recreating the old cloud of per-cell direction markers.
+  for (let entranceIndex = 0; entranceIndex < plan.entrances.length; entranceIndex++) {
+    const start = plan.entrances[entranceIndex];
+    const pending = [{ point: start, points: [start], amount: entranceShare }];
+    let expansions = 0, completed = 0;
+    while (pending.length && completed < 3 && expansions++ < 256) {
+      pending.sort((a, b) => b.amount - a.amount);
+      const state = pending.shift()!;
+      const choices = (outgoing.get(key(state.point)) ?? []).filter(link => !state.points.some(point => key(point) === key(link.to)));
+      if (!choices.length) {
+        routes.push({ entranceIndex, amount: state.amount, points: state.points }); completed++;
+        continue;
+      }
+      const total = choices.reduce((sum, link) => sum + link.amount, 0) || 1;
+      for (const link of choices) {
+        const amount = state.amount * link.amount / total;
+        // Preserve faint side routes, but discard numerical crumbs that would
+        // add visual noise without communicating a meaningful enemy stream.
+        if (amount >= .004) pending.push({ point: link.to, points: [...state.points, link.to], amount });
+      }
+    }
+    if (!completed && pending.length) {
+      const state = pending.sort((a, b) => b.amount - a.amount)[0];
+      routes.push({ entranceIndex, amount: state.amount, points: state.points });
+    }
+  }
+  return routes.sort((a, b) => b.amount - a.amount);
+}
 
 export function trafficDestination(stage: DungeonStage, _expandCount: number, _cell: Point) { return heartCells(stage.heartOrigin); }
 
@@ -48,7 +91,7 @@ export function simulateTraffic(stage: DungeonStage, expandCount: number): Traff
     traffic.set(value, .012);
     if (next) links.set(`${value}>${key(next)}`, { from: cell, to: next, amount: .012 });
   }
-  return { traffic, links };
+  return { traffic, links, routes: representativeTrafficRoutes(plan, links) };
 }
 
 export function measurePackingSpace(floor: Set<string>) {
