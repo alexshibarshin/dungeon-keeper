@@ -36,6 +36,16 @@ export interface TrapDef {
   impulse?: number;
   targetCap?: number;
   canTargetFlying?: boolean;
+  /** A small, hidden combat obstacle anchored in local footprint coordinates. */
+  obstacle?: { offset: Point; radius: number };
+  /** Combat-only articulated art; preparation keeps using the canonical asset. */
+  turret?: {
+    baseOffset: Point;
+    pivotOffset: Point;
+    muzzleDistance: number;
+    turnSpeed: number;
+    projectileSpeed: number;
+  };
   color: number;
   accent: number;
   glyph: string;
@@ -73,6 +83,7 @@ export interface EnemyState {
   hp: number;
   maxHp: number;
   spawnDelay: number;
+  emerging: boolean;
   entrance: number;
   gateIndex: number;
   laneBias: number;
@@ -106,14 +117,17 @@ export interface RevealStep {
 }
 
 export interface FlowPlan {
-  /** Stable spawn portals for this reveal state. */
+  /** Revealed floor cells through which the authored portals enter. */
   entrances: Point[];
+  /** Spawn positions paired by index with entrances. Can sit outside the board. */
+  spawnPoints: Point[];
   /** Ordered broad checkpoints. Enemies choose their own cells inside each gate. */
   gates: Point[][];
 }
 
 export interface DungeonStage {
   seed: number;
+  layoutId: string;
   name: string;
   archetype: string;
   tagline: string;

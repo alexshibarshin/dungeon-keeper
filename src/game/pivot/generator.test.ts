@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import { FINAL_FLOOR_TARGET, INITIAL_FLOOR_TARGET, PERKS, REVEAL_CHUNK_SIZES, TRAPS, buildWavePreview, trapActivationOffsets } from './config';
-import { activeEntrances, activeFlowGates, buildFlowField, generateDungeon, measurePackingSpace, revealedFloor, simulateTraffic, trafficDestination } from './generator';
+import { PERKS, REVEAL_CHUNK_SIZES, TRAPS, buildWavePreview, trapActivationOffsets } from './config';
+import { activeEntrances, activeSpawnPoints, buildFlowField, generateDungeon, measurePackingSpace, revealedFloor, revealedMask, simulateTraffic, trafficDestination } from './generator';
+import { AUTHORED_LAYOUTS } from './layouts';
 
 const placements = (floor: Set<string>, shape: { x: number; y: number }[]) => {
   let result = 0;
@@ -9,47 +10,53 @@ const placements = (floor: Set<string>, shape: { x: number; y: number }[]) => {
 };
 const pointKey = (point: { x: number; y: number }) => `${point.x},${point.y}`;
 const pointDistance = (a: { x: number; y: number }, b: { x: number; y: number }) => Math.abs(a.x - b.x) + Math.abs(a.y - b.y);
-const contiguous = (points: { x: number; y: number }[]) => {
-  const all = new Set(points.map(pointKey)), seen = new Set([pointKey(points[0])]), queue = [points[0]];
-  for (let index = 0; index < queue.length; index++) {
-    const point = queue[index];
-    for (const next of [{ x: point.x + 1, y: point.y }, { x: point.x - 1, y: point.y }, { x: point.x, y: point.y + 1 }, { x: point.x, y: point.y - 1 }]) {
-      if (all.has(pointKey(next)) && !seen.has(pointKey(next))) { seen.add(pointKey(next)); queue.push(next); }
-    }
-  }
-  return seen.size === points.length;
-};
 
-describe('floor-only backpack dungeon', () => {
-  it('generates a broad 1,000-seed corpus without escaping the validated contract', () => {
+describe('authored floor-only backpack dungeons', () => {
+  it('selects only configured layouts deterministically across a broad seed corpus', () => {
     for (let seed = 1; seed <= 1_000; seed++) {
       const stage = generateDungeon(seed * 2654435761);
-      expect(stage.initialFloor).toHaveLength(INITIAL_FLOOR_TARGET);
-      expect(revealedFloor(stage, REVEAL_CHUNK_SIZES.length).size).toBe(FINAL_FLOOR_TARGET);
+      const layout = AUTHORED_LAYOUTS.find(value => value.id === stage.layoutId)!;
+      expect(stage).toEqual(generateDungeon(seed * 2654435761));
+      expect(stage.initialFloor).toHaveLength(layout.zones.join('').split('').filter(cell => cell === '1').length);
+      expect(revealedFloor(stage, REVEAL_CHUNK_SIZES.length).size).toBe(layout.zones.join('').split('').filter(cell => /^[1-5]$/.test(cell)).length);
       expect(stage.flowPlans).toHaveLength(REVEAL_CHUNK_SIZES.length + 1);
+    }
+    expect(new Set([generateDungeon(0).layoutId, generateDungeon(1).layoutId])).toEqual(new Set(AUTHORED_LAYOUTS.map(layout => layout.id)));
+  });
+
+  it('keeps four monotonic authored reveals and puts every spawn arrow outside its active floor', () => {
+    for (let seed = 0; seed < AUTHORED_LAYOUTS.length; seed++) {
+      const stage = generateDungeon(seed);
+      let previous = new Set<string>();
+      for (let expand = 0; expand <= REVEAL_CHUNK_SIZES.length; expand++) {
+        const floor = revealedFloor(stage, expand), entrances = activeEntrances(stage, expand), spawns = activeSpawnPoints(stage, expand);
+        expect([...previous].every(cell => floor.has(cell))).toBe(true);
+        expect(entrances).toHaveLength(spawns.length);
+        expect(spawns.length).toBeGreaterThanOrEqual(1);
+        expect(spawns.length).toBeLessThanOrEqual(4);
+        spawns.forEach((spawn, index) => {
+          expect(floor.has(pointKey(spawn)), `${stage.layoutId}:${expand}:${pointKey(spawn)}`).toBe(false);
+          expect(pointDistance(spawn, entrances[index])).toBe(1);
+        });
+        previous = floor;
+      }
+      expect(activeEntrances(stage, 0).length).toBeGreaterThanOrEqual(1);
+      const field = buildFlowField(stage, REVEAL_CHUNK_SIZES.length);
+      for (const entrance of activeEntrances(stage, REVEAL_CHUNK_SIZES.length)) expect(Number.isFinite(field[entrance.y][entrance.x])).toBe(true);
     }
   });
 
-  it('generates deterministic, connected four-step reveals with 1–3 portals', () => {
-    for (let seed = 1; seed <= 80; seed++) {
-      const stage = generateDungeon(seed * 7919);
-      expect(stage).toEqual(generateDungeon(seed * 7919));
-      expect(stage.initialFloor).toHaveLength(INITIAL_FLOOR_TARGET);
-      expect(stage.revealPlan.map(s => s.cells.length).sort()).toEqual([...REVEAL_CHUNK_SIZES].sort());
-      expect(revealedFloor(stage, REVEAL_CHUNK_SIZES.length).size).toBe(FINAL_FLOOR_TARGET);
-      expect(activeEntrances(stage, 0).length).toBeGreaterThanOrEqual(1);
-      expect(activeEntrances(stage, 0).length).toBeLessThanOrEqual(3);
-      expect(activeFlowGates(stage, 0).length).toBeGreaterThanOrEqual(1);
-      expect(activeFlowGates(stage, 0).length).toBeLessThanOrEqual(2);
-      expect(activeFlowGates(stage, 0)[0].length).toBeGreaterThan(0);
-      for (const gate of activeFlowGates(stage, 0)[0]) expect(revealedFloor(stage, 0).has(`${gate.x},${gate.y}`)).toBe(true);
-      const field = buildFlowField(stage, REVEAL_CHUNK_SIZES.length);
-      for (const entrance of activeEntrances(stage, REVEAL_CHUNK_SIZES.length)) expect(Number.isFinite(field[entrance.y][entrance.x])).toBe(true);
-      for (let expand = 0; expand <= REVEAL_CHUNK_SIZES.length; expand++) {
-        for (const gate of activeFlowGates(stage, expand)) {
-          const gateField = buildFlowField(stage, expand, false, gate);
-          for (const entrance of activeEntrances(stage, expand)) expect(Number.isFinite(gateField[entrance.y][entrance.x]), `${seed}:${expand}`).toBe(true);
+  it('never leaks future floor topology through the fog visibility mask', () => {
+    for (let seed = 0; seed < AUTHORED_LAYOUTS.length; seed++) {
+      const stage = generateDungeon(seed);
+      for (let expand = 0; expand < REVEAL_CHUNK_SIZES.length; expand++) {
+        const floor = revealedFloor(stage, expand), mask = revealedMask(stage, expand);
+        for (let y = 0; y < 12; y++) for (let x = 0; x < 8; x++) {
+          const cell = `${x},${y}`;
+          if (stage.fullGrid[y][x] === 'floor' && !floor.has(cell)) expect(mask.has(cell), `${stage.layoutId}:${expand}:${cell}`).toBe(false);
         }
+        for (const spawn of activeSpawnPoints(stage, expand)) if (spawn.x >= 0 && spawn.y >= 0 && spawn.x < 8 && spawn.y < 12)
+          expect(mask.has(pointKey(spawn)), `${stage.layoutId}:${expand}:spawn:${pointKey(spawn)}`).toBe(false);
       }
     }
   });
@@ -61,35 +68,16 @@ describe('floor-only backpack dungeon', () => {
     }
   });
 
-  it('pre-generates stable stream extensions and contiguous ordered room gates', () => {
-    for (let seed = 1; seed <= 240; seed++) {
-      const stage = generateDungeon(seed * 8191);
+  it('connects every authored entrance to the Heart at every reveal state', () => {
+    for (let seed = 0; seed < AUTHORED_LAYOUTS.length; seed++) {
+      const stage = generateDungeon(seed);
       expect(stage.flowPlans).toHaveLength(REVEAL_CHUNK_SIZES.length + 1);
-      let previousFloor = new Set<string>(), previousEntrances: { x: number; y: number }[] = [];
       for (let expand = 0; expand <= REVEAL_CHUNK_SIZES.length; expand++) {
-        const floor = revealedFloor(stage, expand), entrances = activeEntrances(stage, expand), gates = activeFlowGates(stage, expand);
-        for (const cell of previousFloor) expect(floor.has(cell), `${seed}:${expand}:${cell}`).toBe(true);
-        if (expand > 0) {
-          expect(entrances.length).toBeGreaterThanOrEqual(previousEntrances.length);
-          expect(entrances.length - previousEntrances.length).toBeLessThanOrEqual(1);
-        }
-        previousEntrances.forEach((portal, index) => expect(pointDistance(portal, entrances[index]), `${seed}:${expand}:stream-${index}`).toBeLessThanOrEqual(4));
-        expect(gates.length).toBeGreaterThanOrEqual(1);
-        let sources = entrances;
-        for (const gate of gates) {
-          expect(gate.length).toBeGreaterThanOrEqual(2);
-          expect(gate.length).toBeLessThanOrEqual(3);
-          expect(contiguous(gate)).toBe(true);
-          const field = buildFlowField(stage, expand, false, gate);
-          for (const source of sources) expect(Number.isFinite(field[source.y][source.x]), `${seed}:${expand}:${pointKey(source)}`).toBe(true);
-          sources = gate;
-        }
+        const floor = revealedFloor(stage, expand), entrances = activeEntrances(stage, expand);
         const heartField = buildFlowField(stage, expand);
-        for (const source of sources) expect(Number.isFinite(heartField[source.y][source.x])).toBe(true);
+        for (const source of entrances) expect(Number.isFinite(heartField[source.y][source.x])).toBe(true);
         const packing = measurePackingSpace(floor);
         expect(packing.twoByTwoBlocks).toBeGreaterThanOrEqual(3);
-        expect(packing.deadEnds).toBeLessThanOrEqual(Math.max(3, Math.floor(floor.size * .12)));
-        previousFloor = floor; previousEntrances = entrances;
       }
     }
   });

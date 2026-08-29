@@ -4,7 +4,7 @@ import {
   RECYCLER_TARGETS, REROLL_PRICES, ROWS, SHOP_Y, STARTING_COINS, TIER_DAMAGE, TIER_ZONE, TRAPS, TRAP_IDS,
   WAVE_INCOME, WIDTH, buildWavePreview, trapActivationOffsets,
 } from './config';
-import { activeEntrances, activeFlowGates, buildFlowField, generateDungeon, mulberry32, revealedFloor, revealedMask, simulateTraffic } from './generator';
+import { activeEntrances, activeFlowGates, activeSpawnPoints, buildFlowField, generateDungeon, mulberry32, revealedFloor, revealedMask, simulateTraffic } from './generator';
 import type { TrafficSimulation } from './generator';
 import type {
   DungeonStage, EnemyKind, EnemyState, GameSnapshot, PerkDef, Point, RunStats, TrapDef, TrapId, TrapItem, TrapTag, TrapTier,
@@ -14,6 +14,7 @@ type DragOrigin = { location: TrapItem['location']; origin?: Point; index?: numb
 type DragState = { itemId: string; grab: Point; origin: DragOrigin; x: number; y: number; boardOrigin: Point | null; valid: boolean };
 type Burst = { x: number; y: number; age: number; life: number; size: number; color: number; kind: 'ring' | 'burst' | 'coin' | 'shard' | 'reroll' };
 type Beam = { x: number; y: number; x2: number; y2: number; age: number; life: number; color: number; width: number };
+type Projectile = { kind: 'flame' | 'icicle' | 'cannon'; x: number; y: number; x2: number; y2: number; age: number; life: number; color: number };
 type ZonePop = { itemId: string; text: string; age: number; delay: number };
 type ItemMotion = { from: Point; to: Point; age: number; life: number };
 type DustParticle = { x: number; y: number; vx: number; vy: number; age: number; life: number; size: number; color: number };
@@ -27,6 +28,16 @@ const pkey = (p: Point) => `${p.x},${p.y}`;
 const clamp = (value: number, min: number, max: number) => Math.max(min, Math.min(max, value));
 const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
 const dirs: Point[] = [{ x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 }];
+const rotatingTurretIds = ['flame', 'icicle', 'cannon'] as const;
+type RotatingTurretId = typeof rotatingTurretIds[number];
+const turretArt: Record<RotatingTurretId, {
+  asset: string; sheet: { width: number; height: number }; baseFrame: Rectangle; headFrame: Rectangle;
+  baseAnchor: Point; headAnchor: Point; baseSize: Point; headSize: Point;
+}> = {
+  cannon: { asset: 'cannon-combat-parts-v1', sheet: { width: 1774, height: 887 }, baseFrame: new Rectangle(0, 0, 780, 887), headFrame: new Rectangle(780, 0, 994, 887), baseAnchor: { x: .54, y: .5 }, headAnchor: { x: .27, y: .5 }, baseSize: { x: 84, y: 100 }, headSize: { x: 115, y: 105 } },
+  flame: { asset: 'flame-combat-parts-v1', sheet: { width: 1774, height: 887 }, baseFrame: new Rectangle(0, 0, 760, 887), headFrame: new Rectangle(760, 0, 1014, 887), baseAnchor: { x: .51, y: .5 }, headAnchor: { x: .24, y: .5 }, baseSize: { x: 86, y: 100 }, headSize: { x: 108, y: 104 } },
+  icicle: { asset: 'icicle-combat-parts-v1', sheet: { width: 1536, height: 1024 }, baseFrame: new Rectangle(0, 0, 650, 1024), headFrame: new Rectangle(650, 0, 886, 1024), baseAnchor: { x: .49, y: .5 }, headAnchor: { x: .35, y: .47 }, baseSize: { x: 72, y: 92 }, headSize: { x: 98, y: 92 } },
+};
 
 const baseStats = (): RunStats => ({ killed: 0, leaked: 0, damageTaken: 0, trapDamage: {}, wavesCleared: 0, rerolls: 0, expands: 0, recycled: 0 });
 
@@ -52,12 +63,17 @@ export class PivotEngine {
   labelLayer = new Container();
 
   terrainTextures: Partial<Record<'wall' | 'floor' | 'heart' | 'fog', Texture>> = {};
+  fogCloudTexture: Texture | null = null;
+  fogCloudSprite: Sprite | null = null;
   trapTextures: Partial<Record<TrapId, Texture>> = {};
+  combatTurretTextures: Partial<Record<RotatingTurretId, { base: Texture; head: Texture }>> = {};
   zoneArrowTexture: Texture | null = null;
   enemyFrames: Partial<Record<EnemyKind, Texture[]>> = {};
   terrainSprites = new Map<string, Sprite>();
   fogSprites = new Map<string, Sprite>();
   segmentSprites = new Map<string, Sprite>();
+  turretBaseSprites = new Map<string, Sprite>();
+  turretHeadSprites = new Map<string, Sprite>();
   enemySprites = new Map<number, Sprite>();
   portalIconSprites = new Map<string, Sprite>();
   portalCountTexts = new Map<number, Text>();
@@ -91,6 +107,7 @@ export class PivotEngine {
   gateFlows: number[][][] = [];
   bursts: Burst[] = [];
   beams: Beam[] = [];
+  projectiles: Projectile[] = [];
   zonePops: ZonePop[] = [];
   segmentPulse = new Map<string, number>();
   trafficHeat = new Map<string, number>();
@@ -116,6 +133,9 @@ export class PivotEngine {
   itemMotions = new Map<string, ItemMotion>();
   dust: DustParticle[] = [];
   recycleFlights: RecycleFlight[] = [];
+  turretAngles = new Map<string, number>();
+  turretRecoil = new Map<string, number>();
+  obstacleAvoidance = new Map<number, { itemId: string; side: -1 | 1 }>();
 
   constructor(seed: number, onSnapshot: (snapshot: GameSnapshot) => void, stage = generateDungeon(seed)) {
     this.stage = stage;
@@ -132,8 +152,15 @@ export class PivotEngine {
     await this.app.init({ width: WIDTH, height: HEIGHT, backgroundColor: 0x15111b, antialias: true, resolution: Math.min(devicePixelRatio, 2), autoDensity: true });
     const terrainEntries = await Promise.all((['wall', 'floor', 'heart', 'fog'] as const).map(async kind => [kind, await Assets.load<Texture>(`/assets/terrain/pivot-${kind === 'wall' ? 'rock-v2' : kind === 'floor' ? 'floor-v2' : `${kind}-v1`}.png`)] as const));
     for (const [kind, texture] of terrainEntries) this.terrainTextures[kind] = texture;
+    const fogSource = this.terrainTextures.fog;
+    if (fogSource) this.fogCloudTexture = new Texture({ source: fogSource.source, frame: new Rectangle(0, 0, Math.max(1, fogSource.width - 38), fogSource.height) });
     const trapEntries = await Promise.all(TRAP_IDS.map(async id => [id, await Assets.load<Texture>(`/assets/traps/${TRAPS[id].assetId}.png`)] as const));
     for (const [id, texture] of trapEntries) this.trapTextures[id] = texture;
+    const combatTurretEntries = await Promise.all(rotatingTurretIds.map(async id => [id, await Assets.load<Texture>(`/assets/traps/combat/${turretArt[id].asset}.png`)] as const));
+    for (const [id, sheet] of combatTurretEntries) this.combatTurretTextures[id] = {
+      base: new Texture({ source: sheet.source, frame: turretArt[id].baseFrame }),
+      head: new Texture({ source: sheet.source, frame: turretArt[id].headFrame }),
+    };
     this.zoneArrowTexture = await Assets.load<Texture>('/assets/ui/zone-up.svg');
     const enemyEntries = await Promise.all((Object.keys(ENEMIES) as EnemyKind[]).map(async kind => {
       const sheet = await Assets.load<Texture>(`/assets/enemies/${enemyAsset[kind]}-sheet-v2.png`);
@@ -149,6 +176,7 @@ export class PivotEngine {
     // The item-frame layer also paints the shop tray. Keep it below item sprites so
     // the tray never masks the traps it is meant to present.
     this.root.addChild(this.backgroundLayer, this.terrainLayer, this.fogLayer, this.boardLayer, this.itemFrameLayer, this.tierArtLayer, this.itemLayer, this.routeLayer, this.portalLayer, this.enemyLayer, this.fxLayer, this.labelLayer);
+    this.itemLayer.sortableChildren = true;
     this.portalLayer.addChild(this.portalGraphics);
     this.app.canvas.addEventListener('pointerdown', this.onPointerDown);
     window.addEventListener('pointermove', this.onPointerMove, { passive: false });
@@ -190,6 +218,7 @@ export class PivotEngine {
   get boardItems() { return this.items.filter(item => item.location === 'board'); }
   get hold() { return this.items.find(item => item.location === 'hold') ?? null; }
   get entrances() { return activeEntrances(this.stage, this.expandCount); }
+  get spawnPoints() { return activeSpawnPoints(this.stage, this.expandCount); }
   get gates() { return activeFlowGates(this.stage, this.expandCount); }
   get revealedFloorSet() { return revealedFloor(this.stage, this.expandCount); }
   get revealedMaskSet() { return revealedMask(this.stage, this.expandCount); }
@@ -288,7 +317,7 @@ export class PivotEngine {
     if (this.phase !== 'prep' || this.drag || this.expandCost == null) return;
     if (this.coins < this.expandCost) { this.showMessage('Not enough coins', 1); this.emit(); return; }
     const beforeMask = this.revealedMaskSet;
-    const beforeEntrances = new Set(this.entrances.map(pkey));
+    const beforeSpawns = new Set(this.spawnPoints.map(pkey));
     this.coins -= this.expandCost; this.expandCount++; this.stats.expands++;
     this.flow = buildFlowField(this.stage, this.expandCount);
     this.flyFlow = buildFlowField(this.stage, this.expandCount, true);
@@ -309,7 +338,7 @@ export class PivotEngine {
         life: .58 + this.rand() * .42, size: 3 + this.rand() * 6, color: this.stage.fullGrid[y][x] === 'wall' ? 0xb39a78 : 0xe1c497,
       });
     }
-    this.newPortalKeys = new Set(this.entrances.map(pkey).filter(value => !beforeEntrances.has(value)));
+    this.newPortalKeys = new Set(this.spawnPoints.map(pkey).filter(value => !beforeSpawns.has(value)));
     this.expandFx = 1.15;
     this.drawTerrain();
     this.showMessage('The dungeon grows');
@@ -319,17 +348,17 @@ export class PivotEngine {
   battle() {
     if (this.phase !== 'prep' || this.drag) return;
     this.recycleShop();
-    this.phase = 'combat'; this.paused = false; this.enemies = []; this.spawnQueue = []; this.trafficHeat.clear(); this.trafficCoverage.clear();
-    const entrances = this.entrances, groups = this.distributedRoster();
+    this.phase = 'combat'; this.paused = false; this.enemies = []; this.spawnQueue = []; this.trafficHeat.clear(); this.trafficCoverage.clear(); this.obstacleAvoidance.clear();
+    const entrances = this.entrances, spawnPoints = this.spawnPoints, groups = this.distributedRoster();
     const queue: { kind: EnemyKind; entrance: number }[] = [];
     const longest = Math.max(...groups.map(group => group.length));
     for (let row = 0; row < longest; row++) groups.forEach((group, entrance) => { if (group[row]) queue.push({ kind: group[row], entrance }); });
     const hpScale = 1 + Math.pow((this.wave - 1) / 9, 1.55) * 2.15;
     queue.forEach(({ kind, entrance }, index) => {
-      const def = ENEMIES[kind], point = entrances[entrance];
+      const def = ENEMIES[kind], point = spawnPoints[entrance] ?? entrances[entrance];
       this.spawnQueue.push({
         id: this.nextEnemyId++, kind, x: BOARD_X + (point.x + .5) * CELL, y: BOARD_Y + (point.y + .5) * CELL,
-        vx: 0, vy: 0, hp: def.hp * hpScale, maxHp: def.hp * hpScale, spawnDelay: index * .05,
+        vx: 0, vy: 0, hp: def.hp * hpScale, maxHp: def.hp * hpScale, spawnDelay: index * .05, emerging: true,
         entrance, gateIndex: 0, laneBias: this.rand() * 2 - 1, burnDps: 0, burnTime: 0, burnSourceId: null, slow: 0, slowTime: 0, frostSourceId: null,
         vulnerable: 0, vulnerableTime: 0, hardControlLevel: 0, hardControlWindow: 0, hardControlImmune: 0,
         noProgressTime: 0, bestFlowDistance: Infinity, impulseTime: 0, airborneTime: 0, airborneDuration: 0, impactDamage: 0, impactRadius: 0, impactSourceId: null, impulseSourceId: null, launched: false, collisionSpent: false, dead: false,
@@ -368,7 +397,7 @@ export class PivotEngine {
     const currentStage = this.stage;
     this.phase = 'prep'; this.wave = 1; this.coins = STARTING_COINS; this.hp = HEART_HP; this.maxHp = HEART_HP;
     this.expandCount = 0; this.rerollIndex = 0; this.recyclerPoints = 0; this.recyclerLevel = 0; this.freeRerolls = 0;
-    this.items = []; this.selectedPerks = []; this.perkChoices = []; this.enemies = []; this.spawnQueue = []; this.dust = []; this.recycleFlights = []; this.itemMotions.clear();
+    this.items = []; this.selectedPerks = []; this.perkChoices = []; this.enemies = []; this.spawnQueue = []; this.dust = []; this.recycleFlights = []; this.itemMotions.clear(); this.obstacleAvoidance.clear();
     this.enemyHint = null; this.pendingRecycleId = null; this.revealFog.clear(); this.newPortalKeys.clear(); this.payoutTimer = -1; this.shopSlide = 0; this.shopSlideDelay = 0; this.message = ''; this.messageTimer = 0;
     this.stats = baseStats(); this.victory = null; this.stage = currentStage; this.flow = buildFlowField(this.stage, 0); this.flyFlow = buildFlowField(this.stage, 0, true); this.gateFlows = activeFlowGates(this.stage, 0).map(gate => buildFlowField(this.stage, 0, false, gate)); this.routeSimulation = simulateTraffic(this.stage, 0);
     this.addShopBatch(); this.drawTerrain(); this.emit();
@@ -620,7 +649,8 @@ export class PivotEngine {
   private drawTerrain() {
     if (!this.initialized) return;
     this.terrainLayer.removeChildren().forEach(child => child.destroy()); this.fogLayer.removeChildren().forEach(child => child.destroy()); this.terrainSprites.clear(); this.fogSprites.clear();
-    const visible = this.revealedMaskSet;
+    this.fogCloudSprite = null;
+    const visible = this.revealedMaskSet, activeFloor = this.revealedFloorSet;
     const wallTexture = this.terrainTextures.wall;
     if (wallTexture) {
       // One continuous low-frequency mass: repeating the rock bitmap per cell
@@ -631,21 +661,38 @@ export class PivotEngine {
       this.terrainLayer.addChild(wallBackdrop); this.terrainSprites.set('__wall', wallBackdrop);
     }
     for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
-      const value = `${x},${y}`, cell = this.stage.fullGrid[y][x], shown = visible.has(value) || cell === 'heart';
+      const value = `${x},${y}`, cell = this.stage.fullGrid[y][x];
+      const shown = cell === 'heart' || activeFloor.has(value) || (cell === 'wall' && visible.has(value));
       if (cell === 'heart') continue;
-      if (cell === 'floor' && this.terrainTextures.floor) {
+      // Future floor does not exist visually until its reveal step. Drawing it
+      // dimly under fog leaks the authored topology through colour and seams.
+      if (cell === 'floor' && activeFloor.has(value) && this.terrainTextures.floor) {
         const sprite = new Sprite(this.terrainTextures.floor); sprite.x = BOARD_X + x * CELL; sprite.y = BOARD_Y + y * CELL; sprite.width = CELL; sprite.height = CELL;
-        sprite.tint = 0xfff4df; sprite.alpha = shown ? 1 : .2;
+        sprite.tint = 0xfff4df; sprite.alpha = 1;
         this.terrainLayer.addChild(sprite); this.terrainSprites.set(value, sprite);
       }
       if (!shown || this.revealFog.has(value)) {
-        // Fog intentionally stays almost flat: it conceals topology without
-        // competing with traps, enemies, or the readable stone grid.
+        // An opaque base guarantees secrecy; the masked cloud layer above it
+        // supplies motion and texture without exposing future terrain.
         const fog = new Sprite(Texture.WHITE);
         fog.x = BOARD_X + x * CELL; fog.y = BOARD_Y + y * CELL; fog.width = CELL; fog.height = CELL;
-        fog.tint = 0x172331; fog.alpha = !shown || this.revealFog.has(value) ? .94 : 0;
+        fog.tint = 0x111a2a; fog.alpha = !shown || this.revealFog.has(value) ? .88 : 0;
         this.fogLayer.addChild(fog); this.fogSprites.set(value, fog);
       }
+    }
+    if (this.fogCloudTexture) {
+      const mask = new Graphics();
+      for (let y = 0; y < ROWS; y++) for (let x = 0; x < COLS; x++) {
+        const value = `${x},${y}`, cell = this.stage.fullGrid[y][x];
+        const shown = cell === 'heart' || activeFloor.has(value) || (cell === 'wall' && visible.has(value));
+        if (!shown) mask.rect(BOARD_X + x * CELL, BOARD_Y + y * CELL, CELL, CELL);
+      }
+      mask.fill(0xffffff);
+      const cloud = new Sprite(this.fogCloudTexture); cloud.anchor.set(.5);
+      cloud.x = BOARD_X + BOARD_W / 2; cloud.y = BOARD_Y + BOARD_H / 2;
+      cloud.width = BOARD_W * 1.18; cloud.height = BOARD_H * 1.12;
+      cloud.tint = 0x8fa9ff; cloud.alpha = .78; cloud.mask = mask;
+      this.fogLayer.addChild(cloud, mask); this.fogCloudSprite = cloud;
     }
     const heart = this.stage.heartOrigin, heartTexture = this.terrainTextures.heart;
     if (heartTexture) {
@@ -686,7 +733,7 @@ export class PivotEngine {
       enemy.vulnerableTime = Math.max(0, enemy.vulnerableTime - dt); if (!enemy.vulnerableTime) enemy.vulnerable = 0;
       enemy.hardControlWindow = Math.max(0, enemy.hardControlWindow - dt); enemy.hardControlImmune = Math.max(0, enemy.hardControlImmune - dt);
       if (enemy.impulseTime > 0) {
-        enemy.impulseTime -= dt; enemy.airborneTime = Math.max(0, enemy.airborneTime - dt); enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt; this.resolveTerrainCollision(enemy);
+        enemy.impulseTime -= dt; enemy.airborneTime = Math.max(0, enemy.airborneTime - dt); enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt; this.resolveTrapObstacleCollision(enemy); this.resolveTerrainCollision(enemy);
         if (enemy.impulseTime <= 0) { this.triggerImpact(enemy); enemy.launched = false; enemy.impulseSourceId = null; }
         continue;
       }
@@ -698,6 +745,7 @@ export class PivotEngine {
       if (this.phase === 'result') return;
     }
     this.resolveCrowd(dt);
+    this.updateTurretAim(dt);
     this.activateTraps();
     this.updateHeart(dt);
     if (this.enemies.every(enemy => enemy.dead)) {
@@ -716,18 +764,36 @@ export class PivotEngine {
 
   private steerEnemy(enemy: EnemyState, dt: number) {
     const def = ENEMIES[enemy.kind];
+    const entrance = this.entrances[enemy.entrance];
+    if (entrance && enemy.emerging) {
+      const tx = BOARD_X + (entrance.x + .5) * CELL, ty = BOARD_Y + (entrance.y + .5) * CELL;
+      const dx = tx - enemy.x, dy = ty - enemy.y, length = Math.hypot(dx, dy);
+      if (length > CELL * .28) {
+        const speed = def.speed * (enemy.slowTime > 0 ? 1 - enemy.slow : 1);
+        enemy.vx += (dx / length * speed - enemy.vx) * Math.min(1, dt * 8);
+        enemy.vy += (dy / length * speed - enemy.vy) * Math.min(1, dt * 8);
+        enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt;
+        return;
+      }
+      enemy.x = tx; enemy.y = ty; enemy.vx = 0; enemy.vy = 0;
+      enemy.emerging = false;
+      const firstField = this.gateFlows[0] ?? this.flow;
+      enemy.bestFlowDistance = firstField[entrance.y]?.[entrance.x] ?? 0;
+    }
     const gate = this.gates[enemy.gateIndex];
     // Flying only changes which traps can hit this enemy. It must not let the
     // enemy bypass the authored macro-flow that the player saw in preparation.
     const gateField = gate ? this.gateFlows[enemy.gateIndex] : null;
     const field = gateField ?? (def.flying ? this.flyFlow : this.flow);
     const cx = clamp(Math.floor((enemy.x - BOARD_X) / CELL), 0, COLS - 1), cy = clamp(Math.floor((enemy.y - BOARD_Y) / CELL), 0, ROWS - 1);
-    if (gate?.some(point => point.x === cx && point.y === cy)) { enemy.gateIndex++; enemy.bestFlowDistance = Infinity; return; }
+    if (gate?.some(point => (point.x === cx && point.y === cy) || Math.hypot(enemy.x - (BOARD_X + (point.x + .5) * CELL), enemy.y - (BOARD_Y + (point.y + .5) * CELL)) < CELL * .58)) { enemy.gateIndex++; enemy.bestFlowDistance = Infinity; return; }
     const current = field[cy]?.[cx] ?? Infinity;
     if (current < enemy.bestFlowDistance - .05) { enemy.bestFlowDistance = current; enemy.noProgressTime = 0; } else enemy.noProgressTime += dt;
-    if (enemy.noProgressTime > CONTROL_TUNING.noProgressTimeout) enemy.hardControlImmune = 1;
+    const recovering = enemy.noProgressTime > CONTROL_TUNING.noProgressTimeout;
+    if (recovering) enemy.hardControlImmune = 1;
+    const laneBias = recovering ? 0 : enemy.laneBias;
     const progressWeight = 1.15 + Math.min(3.85, enemy.noProgressTime * 1.35);
-    const candidates = dirs.map(dir => ({ x: cx + dir.x, y: cy + dir.y, dir })).filter(p => field[p.y]?.[p.x] <= current + 1 && Number.isFinite(field[p.y]?.[p.x]));
+    const candidates = dirs.map(dir => ({ x: cx + dir.x, y: cy + dir.y, dir })).filter(p => Number.isFinite(field[p.y]?.[p.x]) && (recovering ? field[p.y][p.x] < current : field[p.y][p.x] <= current + 1));
     const scored = candidates.map(candidate => {
       const key = `${candidate.x},${candidate.y}`;
       const flow = field[candidate.y][candidate.x] * progressWeight;
@@ -737,17 +803,91 @@ export class PivotEngine {
       // pockets of a room before it reconverges, instead of merely drawing a
       // wider version of the shortest path.
       const coverage = (this.trafficCoverage.get(key) ?? 0) * 3.2;
-      const lateral = (candidate.dir.x - candidate.dir.y) * enemy.laneBias * .45;
-      return { candidate, score: flow + density + heat + coverage - lateral };
+      const lateral = (candidate.dir.x - candidate.dir.y) * laneBias * .45;
+      return { candidate, score: recovering ? flow : flow + density + heat + coverage - lateral };
     }).sort((a, b) => a.score - b.score);
     const next = scored[0]?.candidate ?? { x: cx, y: cy, dir: { x: 0, y: -1 } };
-    const tx = BOARD_X + (next.x + .5) * CELL - next.dir.y * enemy.laneBias * FLOW_LANE_SPREAD;
-    const ty = BOARD_Y + (next.y + .5) * CELL + next.dir.x * enemy.laneBias * FLOW_LANE_SPREAD;
+    const tx = BOARD_X + (next.x + .5) * CELL - next.dir.y * laneBias * FLOW_LANE_SPREAD;
+    const ty = BOARD_Y + (next.y + .5) * CELL + next.dir.x * laneBias * FLOW_LANE_SPREAD;
     const dx = tx - enemy.x, dy = ty - enemy.y, length = Math.hypot(dx, dy) || 1, slow = enemy.slowTime > 0 ? 1 - enemy.slow : 1;
+    const steered = this.steerAroundTrapObstacles(enemy, dx / length, dy / length);
     const speed = def.speed * slow;
-    enemy.vx += (dx / length * speed - enemy.vx) * Math.min(1, dt * 6);
-    enemy.vy += (dy / length * speed - enemy.vy) * Math.min(1, dt * 6);
+    enemy.vx += (steered.x * speed - enemy.vx) * Math.min(1, dt * 6);
+    enemy.vy += (steered.y * speed - enemy.vy) * Math.min(1, dt * 6);
     enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt;
+    this.resolveTrapObstacleCollision(enemy);
+  }
+
+  private obstacleCenters() {
+    return this.boardItems.flatMap(item => {
+      const obstacle = TRAPS[item.trapId].obstacle;
+      if (!obstacle || !item.origin) return [];
+      return [{
+        itemId: item.id,
+        x: BOARD_X + (item.origin.x + obstacle.offset.x) * CELL,
+        y: BOARD_Y + (item.origin.y + obstacle.offset.y) * CELL,
+        radius: obstacle.radius,
+      }];
+    });
+  }
+
+  private steerAroundTrapObstacles(enemy: EnemyState, directionX: number, directionY: number) {
+    if (ENEMIES[enemy.kind].flying) return { x: directionX, y: directionY };
+    const obstacles = this.obstacleCenters();
+    let avoidance = this.obstacleAvoidance.get(enemy.id);
+    let obstacle = avoidance ? obstacles.find(value => value.itemId === avoidance!.itemId) : undefined;
+    if (obstacle && avoidance) {
+      const toX = obstacle.x - enemy.x, toY = obstacle.y - enemy.y, distanceToCenter = Math.hypot(toX, toY) || .001;
+      const ahead = (directionX * toX + directionY * toY) / distanceToCenter;
+      const clearance = obstacle.radius + ENEMIES[enemy.kind].radius;
+      if (ahead < -.3 && distanceToCenter > clearance + 10) { this.obstacleAvoidance.delete(enemy.id); avoidance = undefined; obstacle = undefined; }
+    }
+    if (!obstacle) {
+      obstacle = obstacles.map(value => {
+        const toX = value.x - enemy.x, toY = value.y - enemy.y, along = directionX * toX + directionY * toY;
+        const perpendicular = Math.abs(directionX * toY - directionY * toX);
+        const clearance = value.radius + ENEMIES[enemy.kind].radius;
+        return { ...value, along, perpendicular, clearance };
+      }).filter(value => value.along > -4 && value.along < value.clearance + 58 && value.perpendicular < value.clearance + 22)
+        .sort((a, b) => a.along - b.along)[0];
+      if (obstacle) {
+        // Alternating the persistent side distributes a dense horde instead
+        // of letting its shared flow target collapse everyone into one queue.
+        const side = ((enemy.id + Math.round((enemy.laneBias + 1) * 7)) & 1) ? -1 : 1;
+        avoidance = { itemId: obstacle.itemId, side }; this.obstacleAvoidance.set(enemy.id, avoidance);
+      }
+    }
+    if (!obstacle || !avoidance) return { x: directionX, y: directionY };
+    const radialXRaw = enemy.x - obstacle.x, radialYRaw = enemy.y - obstacle.y, distanceToCenter = Math.hypot(radialXRaw, radialYRaw) || .001;
+    const radialX = radialXRaw / distanceToCenter, radialY = radialYRaw / distanceToCenter;
+    const tangentX = -radialY * avoidance.side, tangentY = radialX * avoidance.side;
+    const clearance = obstacle.radius + ENEMIES[enemy.kind].radius, influence = clearance + 58;
+    const weight = clamp((influence - distanceToCenter) / Math.max(1, influence - clearance), .22, 1);
+    let x = directionX * (1 - weight * .78) + tangentX * weight * 1.18 + radialX * weight * .3;
+    let y = directionY * (1 - weight * .78) + tangentY * weight * 1.18 + radialY * weight * .3;
+    const length = Math.hypot(x, y) || 1;
+    return { x: x / length, y: y / length };
+  }
+
+  private resolveTrapObstacleCollision(enemy: EnemyState) {
+    if (ENEMIES[enemy.kind].flying) return;
+    for (let pass = 0; pass < 2; pass++) for (const obstacle of this.obstacleCenters()) {
+      let dx = enemy.x - obstacle.x, dy = enemy.y - obstacle.y, distanceToCenter = Math.hypot(dx, dy);
+      const clearance = obstacle.radius + ENEMIES[enemy.kind].radius;
+      if (distanceToCenter >= clearance) continue;
+      if (distanceToCenter < .001) {
+        const velocityLength = Math.hypot(enemy.vx, enemy.vy) || 1, side = this.obstacleAvoidance.get(enemy.id)?.side ?? ((enemy.id & 1) ? -1 : 1);
+        dx = -enemy.vy / velocityLength * side; dy = enemy.vx / velocityLength * side; distanceToCenter = 1;
+      }
+      const push = clearance - distanceToCenter + .25, nx = dx / distanceToCenter, ny = dy / distanceToCenter;
+      enemy.x += nx * push; enemy.y += ny * push;
+      const side = this.obstacleAvoidance.get(enemy.id)?.side ?? ((enemy.id & 1) ? -1 : 1);
+      const tangentX = -ny * side, tangentY = nx * side;
+      const normalSpeed = Math.max(0, enemy.vx * nx + enemy.vy * ny);
+      const tangentSpeed = Math.max(ENEMIES[enemy.kind].speed * .28, enemy.vx * tangentX + enemy.vy * tangentY);
+      enemy.vx = nx * normalSpeed + tangentX * tangentSpeed;
+      enemy.vy = ny * normalSpeed + tangentY * tangentSpeed;
+    }
   }
 
   private localDensity(x: number, y: number, ignore: number) {
@@ -775,6 +915,7 @@ export class PivotEngine {
     const cx = Math.floor((enemy.x - BOARD_X) / CELL), cy = Math.floor((enemy.y - BOARD_Y) / CELL);
     const passable = this.revealedFloorSet.has(`${cx},${cy}`) || (cx >= this.stage.heartOrigin.x && cx < this.stage.heartOrigin.x + 2 && cy >= this.stage.heartOrigin.y && cy < this.stage.heartOrigin.y + 2);
     if (!passable) { enemy.x = before.x; enemy.y = before.y; }
+    else this.resolveTrapObstacleCollision(enemy);
   }
 
   private resolveCrowd(dt: number) {
@@ -814,10 +955,35 @@ export class PivotEngine {
   private checkLeak(enemy: EnemyState) {
     const h = this.stage.heartOrigin, hx = BOARD_X + (h.x + 1) * CELL, hy = BOARD_Y + (h.y + 1) * CELL;
     if (Math.hypot(enemy.x - hx, enemy.y - hy) > CELL * .8) return;
-    enemy.dead = true; this.hp = Math.max(0, this.hp - ENEMIES[enemy.kind].heartDamage); this.stats.leaked++; this.stats.damageTaken += ENEMIES[enemy.kind].heartDamage;
+    enemy.dead = true; this.obstacleAvoidance.delete(enemy.id); this.hp = Math.max(0, this.hp - ENEMIES[enemy.kind].heartDamage); this.stats.leaked++; this.stats.damageTaken += ENEMIES[enemy.kind].heartDamage;
     this.bursts.push({ x: hx, y: hy, age: 0, life: .5, size: 54, color: 0xff4f67, kind: 'burst' });
     this.bursts.push({ x: enemy.x, y: enemy.y, age: 0, life: .8, size: 18, color: 0xffd45c, kind: 'coin' });
     if (this.hp <= 0) { this.phase = 'result'; this.victory = false; this.paused = true; this.emit(); }
+  }
+
+  private trapWorldPoint(item: TrapItem, offset: Point) {
+    return {
+      x: BOARD_X + (item.origin!.x + offset.x) * CELL,
+      y: BOARD_Y + (item.origin!.y + offset.y) * CELL,
+    };
+  }
+
+  private angleDelta(from: number, to: number) {
+    return Math.atan2(Math.sin(to - from), Math.cos(to - from));
+  }
+
+  private updateTurretAim(dt: number) {
+    for (const item of this.boardItems) {
+      const def = TRAPS[item.trapId];
+      if (!def.turret || !item.origin) continue;
+      const pivot = this.trapWorldPoint(item, def.turret.pivotOffset);
+      const target = this.floorTargets(item, pivot)[0];
+      const current = this.turretAngles.get(item.id) ?? 0;
+      if (!target) { this.turretAngles.set(item.id, current); continue; }
+      const desired = Math.atan2(target.y - pivot.y, target.x - pivot.x);
+      const delta = this.angleDelta(current, desired), step = def.turret.turnSpeed * dt;
+      this.turretAngles.set(item.id, current + clamp(delta, -step, step));
+    }
   }
 
   private activateTraps() {
@@ -826,9 +992,14 @@ export class PivotEngine {
       const activators = trapActivationOffsets(def);
       activators.forEach(({ offset, segmentIndex, independent }) => {
         if (item.cooldowns[segmentIndex] > 0 || !item.origin) return;
-        const cell = { x: item.origin.x + offset.x, y: item.origin.y + offset.y }, center = { x: BOARD_X + (cell.x + .5) * CELL, y: BOARD_Y + (cell.y + .5) * CELL };
+        const cell = { x: item.origin.x + offset.x, y: item.origin.y + offset.y };
+        const center = def.turret ? this.trapWorldPoint(item, def.turret.pivotOffset) : { x: BOARD_X + (cell.x + .5) * CELL, y: BOARD_Y + (cell.y + .5) * CELL };
         const targets = this.floorTargets(item, center, independent);
         if (!targets.length) return;
+        if (def.turret) {
+          const targetAngle = Math.atan2(targets[0].y - center.y, targets[0].x - center.x);
+          if (Math.abs(this.angleDelta(this.turretAngles.get(item.id) ?? 0, targetAngle)) > .2) return;
+        }
         item.cooldowns[segmentIndex] = this.getItemCooldown(item);
         if (independent) this.segmentPulse.set(`${item.id}:${segmentIndex}`, .28);
         else def.shape.forEach((_, index) => this.segmentPulse.set(`${item.id}:${index}`, .28));
@@ -888,7 +1059,7 @@ export class PivotEngine {
     else this.damagePops.set(enemy.id, { x: enemy.x, y: enemy.y, damage, age: 0 });
     if (source) this.stats.trapDamage[source.trapId] = (this.stats.trapDamage[source.trapId] ?? 0) + damage;
     if (enemy.hp > 0) return;
-    enemy.dead = true; this.stats.killed++;
+    enemy.dead = true; this.obstacleAvoidance.delete(enemy.id); this.stats.killed++;
     this.bursts.push({ x: enemy.x, y: enemy.y, age: 0, life: .4, size: ENEMIES[enemy.kind].radius * 2.4, color: ENEMIES[enemy.kind].accent, kind: dot ? 'ring' : 'burst' });
     this.bursts.push({ x: enemy.x, y: enemy.y, age: 0, life: .8, size: 18, color: 0xffd45c, kind: 'coin' });
     if (enemy.burnTime > 0 && this.selectedMechanic('fire-death-explosion')) {
@@ -920,7 +1091,18 @@ export class PivotEngine {
   }
 
   private attackFx(item: TrapItem, def: TrapDef, center: Point, targets: EnemyState[]) {
-    if (def.range > 0) for (const target of targets.slice(0, def.id === 'flame' ? 4 : targets.length)) this.beams.push({ x: center.x, y: center.y, x2: target.x, y2: target.y, age: 0, life: def.id === 'flame' ? .18 : .13, color: def.accent, width: def.id === 'flame' ? 9 : 4 });
+    if (def.turret && (def.id === 'flame' || def.id === 'icicle' || def.id === 'cannon')) {
+      const angle = this.turretAngles.get(item.id) ?? 0;
+      const muzzle = { x: center.x + Math.cos(angle) * def.turret.muzzleDistance, y: center.y + Math.sin(angle) * def.turret.muzzleDistance };
+      for (const target of targets.slice(0, def.id === 'flame' ? 4 : 1)) {
+        const travel = Math.hypot(target.x - muzzle.x, target.y - muzzle.y) / def.turret.projectileSpeed;
+        this.projectiles.push({ kind: def.id, x: muzzle.x, y: muzzle.y, x2: target.x, y2: target.y, age: 0, life: clamp(travel, .1, .38), color: def.accent });
+      }
+      this.turretRecoil.set(item.id, .14);
+      this.bursts.push({ x: muzzle.x, y: muzzle.y, age: 0, life: .18, size: def.id === 'flame' ? 25 : 16, color: def.accent, kind: 'burst' });
+    } else if (def.range > 0) {
+      for (const target of targets) this.beams.push({ x: center.x, y: center.y, x2: target.x, y2: target.y, age: 0, life: .13, color: def.accent, width: 4 });
+    }
     this.bursts.push({ x: center.x, y: center.y, age: 0, life: .32, size: Math.max(30, this.getItemArea(item) || 34), color: def.accent, kind: def.id === 'spikes' ? 'shard' : 'ring' });
   }
 
@@ -961,6 +1143,8 @@ export class PivotEngine {
   private updateFx(dt: number) {
     this.bursts.forEach(value => value.age += dt); this.bursts = this.bursts.filter(value => value.age < value.life);
     this.beams.forEach(value => value.age += dt); this.beams = this.beams.filter(value => value.age < value.life);
+    this.projectiles.forEach(value => value.age += dt); this.projectiles = this.projectiles.filter(value => value.age < value.life);
+    for (const [itemId, recoil] of this.turretRecoil) { const next = recoil - dt; if (next <= 0) this.turretRecoil.delete(itemId); else this.turretRecoil.set(itemId, next); }
     this.zonePops.forEach(value => value.age += dt); this.zonePops = this.zonePops.filter(value => value.age < value.delay + 1.1);
     for (const [key, value] of this.segmentPulse) { const next = value - dt; if (next <= 0) this.segmentPulse.delete(key); else this.segmentPulse.set(key, next); }
     for (const [enemyId, pop] of this.damagePops) { pop.age += dt; if (pop.age > .62) this.damagePops.delete(enemyId); }
@@ -999,6 +1183,11 @@ export class PivotEngine {
     for (const [key, fog] of this.fogSprites) if (!this.revealFog.has(key)) {
       const [x, y] = key.split(',').map(Number), wave = this.elapsed * .42 + x * .71 + y * .39;
       fog.rotation = Math.sin(wave) * .008; fog.scale.set(1.04 + Math.sin(wave * .73) * .012);
+    }
+    if (this.fogCloudSprite) {
+      this.fogCloudSprite.x = BOARD_X + BOARD_W / 2 + Math.sin(this.elapsed * .19) * 18;
+      this.fogCloudSprite.y = BOARD_Y + BOARD_H / 2 + Math.cos(this.elapsed * .16) * 14;
+      this.fogCloudSprite.rotation = Math.sin(this.elapsed * .11) * .012;
     }
   }
 
@@ -1069,7 +1258,7 @@ export class PivotEngine {
   }
 
   private drawItems() {
-    const centers = this.itemCenters(), used = new Set<string>(); this.itemFrameLayer.clear();
+    const centers = this.itemCenters(), used = new Set<string>(), usedTurretBases = new Set<string>(), usedTurretHeads = new Set<string>(); this.itemFrameLayer.clear();
     const draggedItem = this.drag ? this.items.find(item => item.id === this.drag!.itemId) ?? null : null;
     const zoneCoverage = draggedItem && this.drag?.boardOrigin ? new Set(this.zoneCells(draggedItem, this.drag.boardOrigin).map(pkey)) : new Set<string>();
     const trayOffset = this.shopSlide * (HEIGHT - SHOP_Y + 24);
@@ -1112,7 +1301,10 @@ export class PivotEngine {
         }
       }
       const spriteKey = item.id, texture = this.trapTextures[item.trapId];
-      if (texture) {
+      const rotatingId = rotatingTurretIds.includes(def.id as RotatingTurretId) ? def.id as RotatingTurretId : null;
+      const combatParts = rotatingId ? this.combatTurretTextures[rotatingId] : null;
+      const articulated = !!(this.phase === 'combat' && item.location === 'board' && item.origin && def.turret && rotatingId && combatParts);
+      if (texture && !articulated) {
         let sprite = this.segmentSprites.get(spriteKey);
         if (!sprite) { sprite = new Sprite(texture); sprite.anchor.set(.5); this.segmentSprites.set(spriteKey, sprite); this.itemLayer.addChild(sprite); }
         used.add(spriteKey); sprite.visible = true; sprite.x = center.x; sprite.y = center.y;
@@ -1121,6 +1313,20 @@ export class PivotEngine {
         sprite.width = (maxX + 1) * unit * .86 * pulseScale; sprite.height = (maxY + 1) * unit * .86 * pulseScale;
         sprite.rotation = activePulse > 0 ? Math.sin((.28 - activePulse) * 38) * (def.element === 'Water' ? .06 : .025) : 0;
         sprite.alpha = isDragged ? .96 : this.phase === 'combat' ? .62 : 1; sprite.tint = flash ? flash.color : 0xffffff;
+      }
+      if (articulated && def.turret && rotatingId && combatParts && item.origin) {
+        const art = turretArt[rotatingId], basePoint = this.trapWorldPoint(item, def.turret.baseOffset), pivot = this.trapWorldPoint(item, def.turret.pivotOffset);
+        let base = this.turretBaseSprites.get(item.id);
+        if (!base) { base = new Sprite(combatParts.base); this.turretBaseSprites.set(item.id, base); this.itemLayer.addChild(base); }
+        usedTurretBases.add(item.id); base.visible = true; base.texture = combatParts.base; base.anchor.set(art.baseAnchor.x, art.baseAnchor.y);
+        base.x = basePoint.x; base.y = basePoint.y; base.width = art.baseSize.x; base.height = art.baseSize.y; base.alpha = .9; base.tint = flash ? flash.color : 0xffffff; base.zIndex = 1;
+        let head = this.turretHeadSprites.get(item.id);
+        if (!head) { head = new Sprite(combatParts.head); this.turretHeadSprites.set(item.id, head); this.itemLayer.addChild(head); }
+        const angle = this.turretAngles.get(item.id) ?? 0, recoilAge = this.turretRecoil.get(item.id) ?? 0;
+        const recoil = recoilAge > 0 ? Math.sin((.14 - recoilAge) / .14 * Math.PI) * 4 : 0;
+        usedTurretHeads.add(item.id); head.visible = true; head.texture = combatParts.head; head.anchor.set(art.headAnchor.x, art.headAnchor.y);
+        head.x = pivot.x - Math.cos(angle) * recoil; head.y = pivot.y - Math.sin(angle) * recoil; head.rotation = angle;
+        head.width = art.headSize.x; head.height = art.headSize.y; head.alpha = .96; head.tint = flash ? flash.color : 0xffffff; head.zIndex = 2;
       }
       for (let index = 0; index < def.shape.length; index++) {
         const offset = def.shape[index], pulse = this.segmentPulse.get(`${item.id}:${index}`) ?? 0;
@@ -1150,6 +1356,8 @@ export class PivotEngine {
       }
     }
     for (const [key, sprite] of this.segmentSprites) if (!used.has(key)) { sprite.destroy(); this.segmentSprites.delete(key); }
+    for (const [key, sprite] of this.turretBaseSprites) if (!usedTurretBases.has(key)) { sprite.destroy(); this.turretBaseSprites.delete(key); }
+    for (const [key, sprite] of this.turretHeadSprites) if (!usedTurretHeads.has(key)) { sprite.destroy(); this.turretHeadSprites.delete(key); }
     if (this.drag) {
       const source = this.items.find(item => item.id === this.drag!.itemId)!;
       const sourceCenter = centers.get(source.id)!;
@@ -1174,7 +1382,10 @@ export class PivotEngine {
       const airborneProgress = enemy.airborneDuration > 0 ? 1 - enemy.airborneTime / enemy.airborneDuration : 1;
       sprite.y = enemy.y - (enemy.airborneTime > 0 ? Math.sin(airborneProgress * Math.PI) * 30 : 0);
       const size = ENEMIES[enemy.kind].radius * (enemy.kind === 'brute' ? 3.5 : 3.2); sprite.width = size; sprite.height = size;
-      sprite.tint = enemy.burnTime > 0 ? 0xff8a55 : enemy.slowTime > 0 ? 0xbcefff : 0xffffff; sprite.alpha = enemy.hardControlImmune > 0 ? .82 : 1;
+      sprite.tint = enemy.burnTime > 0 ? 0xff8a55 : enemy.slowTime > 0 ? 0xbcefff : 0xffffff;
+      const entrance = this.entrances[enemy.entrance], emerging = enemy.emerging && entrance;
+      const emergence = emerging ? clamp(1 - Math.hypot(enemy.x - (BOARD_X + (entrance.x + .5) * CELL), enemy.y - (BOARD_Y + (entrance.y + .5) * CELL)) / CELL, 0, 1) : 1;
+      sprite.alpha = (enemy.hardControlImmune > 0 ? .82 : 1) * (.18 + emergence * .82);
     }
     for (const [id, sprite] of this.enemySprites) if (!used.has(id)) { sprite.destroy(); this.enemySprites.delete(id); }
   }
@@ -1185,16 +1396,26 @@ export class PivotEngine {
     const usedIcons = new Set<string>(), usedCounts = new Set<number>();
     const groups = this.distributedRoster();
     this.entrances.forEach((entrance, entranceIndex) => {
-      const x = BOARD_X + (entrance.x + .5) * CELL, y = BOARD_Y + (entrance.y + .5) * CELL;
-      const isNew = this.newPortalKeys.has(pkey(entrance)), revealAge = 1.15 - this.expandFx;
+      const spawn = this.spawnPoints[entranceIndex] ?? entrance;
+      const rawX = BOARD_X + (spawn.x + .5) * CELL, rawY = BOARD_Y + (spawn.y + .5) * CELL;
+      // The DOM HUD covers the literal off-board top cell. Keep the actual
+      // spawn there, but let the arrowhead pierce the visible dungeon edge.
+      const x = rawX, y = spawn.y < 0 ? BOARD_Y - 4 : rawY;
+      const entryX = BOARD_X + (entrance.x + .5) * CELL, entryY = BOARD_Y + (entrance.y + .5) * CELL;
+      const length = Math.hypot(entryX - x, entryY - y) || 1, nx = (entryX - x) / length, ny = (entryY - y) / length;
+      const isNew = this.newPortalKeys.has(pkey(spawn)), revealAge = 1.15 - this.expandFx;
       if (isNew && this.expandFx > 0 && revealAge < .68) return;
       const portalScale = isNew && this.expandFx > 0 ? clamp((revealAge - .68) / .34, 0, 1) : 1;
-      g.circle(x, y, (25 + Math.sin(this.elapsed * 4 + entranceIndex) * 3) * portalScale).fill({ color: 0x311a4d, alpha: .78 }).stroke({ color: isNew ? 0xd99cff : 0xbc6cff, width: 5 + (1 - portalScale) * 7, alpha: .9 });
+      const pulse = Math.sin(this.elapsed * 5 + entranceIndex * 1.7), shift = pulse * 5, cx = x + nx * shift, cy = y + ny * shift;
+      g.circle(cx, cy, 26 * portalScale).fill({ color: 0x410c18, alpha: .48 }).stroke({ color: 0xff4057, width: 2, alpha: .55 });
+      g.moveTo(cx - nx * 20, cy - ny * 20).lineTo(cx + nx * 14, cy + ny * 14).stroke({ color: 0xff334d, width: 10 * portalScale, alpha: .95 });
+      g.poly([cx + nx * 29, cy + ny * 29, cx + nx * 8 - ny * 13, cy + ny * 8 + nx * 13, cx + nx * 8 + ny * 13, cy + ny * 8 - nx * 13]).fill({ color: 0xff334d, alpha: .98 });
       if (this.phase === 'prep') {
         const group = groups[entranceIndex] ?? [], kinds = ([...new Set(group)] as EnemyKind[]).slice(0, 4);
-        const totalWidth = Math.max(0, (kinds.length - 1) * 18), iconY = entrance.y === 0 ? y + 42 : y - 42;
+        const totalWidth = Math.max(0, (kinds.length - 1) * 18), tangentX = -ny, tangentY = nx;
         kinds.forEach((kind, kindIndex) => {
-          const iconX = clamp(x - totalWidth / 2 + kindIndex * 18 - 15, BOARD_X + 14, BOARD_X + BOARD_W - 46);
+          const iconX = clamp(x + tangentX * 43 - totalWidth / 2 + kindIndex * 18 - 15, 14, WIDTH - 46);
+          const iconY = spawn.y < 0 ? BOARD_Y + 27 : clamp(y + tangentY * 43, 82, BOARD_Y + BOARD_H - 16);
           g.circle(iconX, iconY, 15).fill({ color: 0x1b1720, alpha: .94 }).stroke({ color: ENEMIES[kind].accent, width: 2 });
           const texture = this.enemyFrames[kind]?.[0];
           if (texture) {
@@ -1207,7 +1428,8 @@ export class PivotEngine {
         let count = this.portalCountTexts.get(entranceIndex);
         if (!count) { count = new Text({ text: '', style: new TextStyle({ fontFamily: 'Arial', fontSize: 15, fontWeight: '900', fill: 0xffe6a7, stroke: { color: 0x1a101d, width: 5 } }) }); this.portalCountTexts.set(entranceIndex, count); this.portalLayer.addChild(count); }
         usedCounts.add(entranceIndex); count.text = `×${group.length}`; count.visible = true;
-        count.anchor.set(0, .5); count.x = clamp(x + totalWidth / 2 + 6, BOARD_X + 18, BOARD_X + BOARD_W - 36); count.y = iconY; this.portalLayer.addChild(count);
+        const labelX = x + tangentX * 43 + totalWidth / 2 + 6, labelY = spawn.y < 0 ? BOARD_Y + 27 : y + tangentY * 43;
+        count.anchor.set(0, .5); count.x = clamp(labelX, 18, WIDTH - 36); count.y = clamp(labelY, 82, BOARD_Y + BOARD_H - 16); this.portalLayer.addChild(count);
       }
     });
     for (const [key, icon] of this.portalIconSprites) if (!usedIcons.has(key)) icon.visible = false;
@@ -1217,6 +1439,24 @@ export class PivotEngine {
   private drawFx() {
     const g = this.fxLayer; g.clear(); this.labelLayer.removeChildren().forEach(child => child.destroy());
     for (const beam of this.beams) { if (beam.age < 0) continue; const t = 1 - beam.age / beam.life; g.moveTo(beam.x, beam.y).lineTo(beam.x2, beam.y2).stroke({ color: beam.color, width: beam.width * t, alpha: t }); }
+    for (const projectile of this.projectiles) {
+      const t = clamp(projectile.age / projectile.life, 0, 1), eased = 1 - Math.pow(1 - t, 2);
+      const x = projectile.x + (projectile.x2 - projectile.x) * eased, y = projectile.y + (projectile.y2 - projectile.y) * eased;
+      const dx = projectile.x2 - projectile.x, dy = projectile.y2 - projectile.y, length = Math.hypot(dx, dy) || 1, nx = dx / length, ny = dy / length;
+      if (projectile.kind === 'cannon') {
+        g.moveTo(x - nx * 24, y - ny * 24).lineTo(x, y).stroke({ color: 0x66f7ff, width: 9, alpha: .3 + (1 - t) * .5 });
+        g.circle(x, y, 7).fill({ color: 0x23cfe8, alpha: .92 }).stroke({ color: 0xd3ffff, width: 3, alpha: .96 });
+      } else if (projectile.kind === 'icicle') {
+        const sideX = -ny * 5, sideY = nx * 5;
+        g.poly([x + nx * 12, y + ny * 12, x - nx * 8 + sideX, y - ny * 8 + sideY, x - nx * 8 - sideX, y - ny * 8 - sideY]).fill({ color: 0xc9f8ff, alpha: .96 }).stroke({ color: 0x58c9f1, width: 2, alpha: .9 });
+        g.moveTo(x - nx * 25, y - ny * 25).lineTo(x - nx * 5, y - ny * 5).stroke({ color: projectile.color, width: 3, alpha: .55 });
+      } else {
+        for (let index = 0; index < 4; index++) {
+          const back = index * 8, wobble = Math.sin(projectile.age * 70 + index * 1.7) * 3;
+          g.circle(x - nx * back - ny * wobble, y - ny * back + nx * wobble, 7 - index * 1.1).fill({ color: index < 2 ? 0xffdf55 : 0xff6534, alpha: .82 - index * .12 });
+        }
+      }
+    }
     for (const burst of this.bursts) {
       if (burst.age < 0) continue; const t = clamp(burst.age / burst.life, 0, 1), radius = burst.size * (.35 + t * .9);
       if (burst.kind === 'coin') {
