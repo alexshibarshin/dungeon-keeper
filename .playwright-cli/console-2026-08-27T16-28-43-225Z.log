@@ -1,0 +1,23 @@
+[      91ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=d1a3ea6b:14335
+[    3466ms] [ERROR] Failed to load resource: the server responded with a status of 404 (Not Found) @ http://localhost:5173/favicon.ico:0
+[  667855ms] Error: Unable to generate validated dungeon for seed 908441
+    at generateDungeon (http://localhost:5173/src/game/pivot/generator.ts?t=1787848790448:553:8)
+    at http://localhost:5173/src/App.tsx?t=1787848790448:989:30
+    at updateMemo (http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=d1a3ea6b:4948:16)
+    at Object.useMemo (http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=d1a3ea6b:13274:13)
+    at exports.useMemo (http://localhost:5173/node_modules/.vite/deps/react.js?v=d1a3ea6b:736:31)
+    at Game (http://localhost:5173/src/App.tsx?t=1787848790448:989:16)
+    at Object.react_stack_bottom_frame (http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=d1a3ea6b:12866:12)
+    at renderWithHooks (http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=d1a3ea6b:4213:19)
+    at updateFunctionComponent (http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=d1a3ea6b:5569:16)
+    at beginWork (http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=d1a3ea6b:6140:20)
+[  667855ms] [WARNING] %s
+
+%s
+ An error occurred in the <Game> component. Consider adding an error boundary to your tree to customize error handling behavior.
+Visit https://react.dev/link/error-boundaries to learn more about error boundaries. @ http://localhost:5173/@vite/client:532
+[ 2709176ms] [LOG] [vite] server connection lost. Polling for restart... @ http://localhost:5173/@vite/client:1002
+[ 2709579ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=d1a3ea6b:14335
+[ 4104044ms] [LOG] [vite] server connection lost. Polling for restart... @ http://localhost:5173/@vite/client:1002
+[ 4104152ms] [INFO] %cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold @ http://localhost:5173/node_modules/.vite/deps/react-dom_client.js?v=d1a3ea6b:14335
+[17334258ms] [LOG] [vite] server connection lost. Polling for restart... @ http://localhost:5173/@vite/client:1002

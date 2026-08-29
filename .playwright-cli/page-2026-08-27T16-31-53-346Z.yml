@@ -1,0 +1,42 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e6]:
+      - generic [ref=e7]:
+        - generic [ref=e8]: Slippery Ledge
+        - generic [ref=e9]: Wave 1/10
+      - generic [ref=e10]:
+        - generic [ref=e11]: ♥
+        - generic [ref=e12]:
+          - text: HEART
+          - emphasis [ref=e15]: 200/200
+      - generic [ref=e16]:
+        - generic [ref=e17]: ◉
+        - generic [ref=e18]: "2"
+      - button "✦ 0" [ref=e19] [cursor=pointer]:
+        - text: ✦
+        - generic [ref=e20]: "0"
+    - generic:
+      - generic: 0/2
+    - generic [ref=e21]:
+      - generic [ref=e22]:
+        - generic [ref=e23]: ◉ 5
+        - button "Expand" [disabled] [ref=e24]
+      - button "Reroll ◉ 2" [disabled] [ref=e25]:
+        - generic [ref=e26]: Reroll
+        - generic [ref=e27]: ◉ 2
+      - button "Battle!" [disabled] [ref=e28]
+    - generic [ref=e30]:
+      - generic [ref=e31]: NEW DUNGEON · Slippery Ledge
+      - heading "Well of Slippery Oaths" [level=1] [ref=e32]
+      - paragraph [ref=e33]: Fast enemies test every gap.
+      - generic [ref=e34]:
+        - generic [ref=e35]:
+          - text: "10"
+          - text: WAVES
+        - generic [ref=e36]:
+          - text: 8×12
+          - text: ARENA
+        - generic [ref=e37]:
+          - text: "2"
+          - text: PORTALS
+      - button "Preparing Dungeon…" [disabled] [ref=e38]
