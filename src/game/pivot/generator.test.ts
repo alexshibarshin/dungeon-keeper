@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { PERKS, REVEAL_CHUNK_SIZES, TRAPS, buildWavePreview, trapActivationOffsets } from './config';
+import { PERKS, REVEAL_CHUNK_SIZES, TRAPS, buildWavePreview, enemyHpScale, trapActivationOffsets } from './config';
 import { activeEntrances, activeSpawnPoints, buildFlowField, generateDungeon, measurePackingSpace, revealedFloor, revealedMask, simulateTraffic, trafficDestination } from './generator';
 import { AUTHORED_LAYOUTS } from './layouts';
 
@@ -143,14 +143,20 @@ describe('authored floor-only backpack dungeons', () => {
     expect(trapActivationOffsets(TRAPS.saw)).toHaveLength(1);
   });
 
-  it('keeps every archetype on the fixed horde budget and introduces Iron March brutes after the opening', () => {
+  it('ramps every archetype from a 20% larger opening horde to a doubled final horde', () => {
+    const expectedTotals = [59, 95, 136, 182, 232, 286, 345, 408, 476, 548];
     for (const archetype of ['Green Tide', 'Slippery Ledge', 'Iron March', 'Winged Cavern', 'All-Sides Siege']) {
       for (let wave = 1; wave <= 10; wave++) {
         const preview = buildWavePreview(archetype, wave);
-        expect(Object.values(preview).reduce((sum, count) => sum + count, 0)).toBe(24 + wave * 25);
+        expect(Object.values(preview).reduce((sum, count) => sum + count, 0)).toBe(expectedTotals[wave - 1]);
       }
     }
     for (let wave = 1; wave < 6; wave++) expect(buildWavePreview('Iron March', wave).brute).toBe(0);
     expect(buildWavePreview('Iron March', 6).brute).toBeGreaterThan(0);
+  });
+
+  it('keeps opening health unchanged and adds 25% to the previous final-wave health', () => {
+    expect(enemyHpScale(1)).toBe(1);
+    expect(enemyHpScale(10)).toBeCloseTo(3.15 * 1.25);
   });
 });

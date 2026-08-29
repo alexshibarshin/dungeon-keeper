@@ -1,14 +1,16 @@
 import { Application, Assets, Container, Graphics, Rectangle, Sprite, Text, TextStyle, Texture } from 'pixi.js';
+import type { Filter } from 'pixi.js';
 import {
   BOARD_H, BOARD_W, BOARD_X, BOARD_Y, CELL, COLS, CONTROL_TUNING, ENEMIES, EXPAND_PRICES, FLOW_DENSITY_AVOIDANCE, FLOW_LANE_SPREAD, HEIGHT, HEART_HP, PERKS,
   RECYCLER_TARGETS, REROLL_PRICES, ROWS, SHOP_Y, STARTING_COINS, TIER_DAMAGE, TIER_ZONE, TRAPS, TRAP_IDS,
-  WAVE_INCOME, WIDTH, buildWavePreview, trapActivationOffsets,
+  WAVE_INCOME, WIDTH, buildWavePreview, enemyHpScale, trapActivationOffsets,
 } from './config';
 import { activeEntrances, activeFlowGates, activeSpawnPoints, buildFlowField, generateDungeon, mulberry32, revealedFloor, revealedMask, simulateTraffic } from './generator';
 import type { TrafficSimulation } from './generator';
 import type {
   DungeonStage, EnemyKind, EnemyState, GameSnapshot, PerkDef, Point, RunStats, TrapDef, TrapId, TrapItem, TrapTag, TrapTier,
 } from './types';
+import { createTierOutlineFilter } from './TierOutlineFilter';
 
 type DragOrigin = { location: TrapItem['location']; origin?: Point; index?: number };
 type DragState = { itemId: string; grab: Point; origin: DragOrigin; x: number; y: number; boardOrigin: Point | null; valid: boolean };
@@ -30,6 +32,16 @@ const distance = (a: Point, b: Point) => Math.hypot(a.x - b.x, a.y - b.y);
 const dirs: Point[] = [{ x: 1, y: 0 }, { x: -1, y: 0 }, { x: 0, y: 1 }, { x: 0, y: -1 }];
 const rotatingTurretIds = ['flame', 'icicle', 'cannon'] as const;
 type RotatingTurretId = typeof rotatingTurretIds[number];
+
+function drawTierStar(g: Graphics, x: number, y: number, radius: number) {
+  const points: number[] = [];
+  for (let index = 0; index < 10; index++) {
+    const angle = -Math.PI / 2 + index * Math.PI / 5, length = index % 2 ? radius * .46 : radius;
+    points.push(x + Math.cos(angle) * length, y + Math.sin(angle) * length);
+  }
+  g.poly(points).fill({ color: 0xffd45f, alpha: 1 }).stroke({ color: 0x5b3514, width: 2.2, alpha: 1 });
+  g.circle(x - radius * .2, y - radius * .2, radius * .13).fill({ color: 0xfff3a6, alpha: .95 });
+}
 const turretArt: Record<RotatingTurretId, {
   asset: string; sheet: { width: number; height: number }; baseFrame: Rectangle; headFrame: Rectangle;
   baseAnchor: Point; headAnchor: Point; baseSize: Point; headSize: Point;
@@ -55,7 +67,7 @@ export class PivotEngine {
   boardLayer = new Graphics();
   itemLayer = new Container();
   itemFrameLayer = new Graphics();
-  tierArtLayer = new Container();
+  tierBadgeLayer = new Graphics();
   enemyLayer = new Container();
   portalLayer = new Container();
   portalGraphics = new Graphics();
@@ -136,6 +148,7 @@ export class PivotEngine {
   turretAngles = new Map<string, number>();
   turretRecoil = new Map<string, number>();
   obstacleAvoidance = new Map<number, { itemId: string; side: -1 | 1 }>();
+  tierFilters: Record<TrapTier, Filter[] | null> = { 1: null, 2: null, 3: null };
 
   constructor(seed: number, onSnapshot: (snapshot: GameSnapshot) => void, stage = generateDungeon(seed)) {
     this.stage = stage;
@@ -150,6 +163,8 @@ export class PivotEngine {
 
   async mount(host: HTMLElement) {
     await this.app.init({ width: WIDTH, height: HEIGHT, backgroundColor: 0x15111b, antialias: true, resolution: Math.min(devicePixelRatio, 2), autoDensity: true });
+    this.tierFilters[2] = [createTierOutlineFilter(0x83f06a, 2.4, .42)];
+    this.tierFilters[3] = [createTierOutlineFilter(0x4eddf5, 3.1, .56)];
     const terrainEntries = await Promise.all((['wall', 'floor', 'heart', 'fog'] as const).map(async kind => [kind, await Assets.load<Texture>(`/assets/terrain/pivot-${kind === 'wall' ? 'rock-v2' : kind === 'floor' ? 'floor-v2' : `${kind}-v1`}.png`)] as const));
     for (const [kind, texture] of terrainEntries) this.terrainTextures[kind] = texture;
     const fogSource = this.terrainTextures.fog;
@@ -175,7 +190,7 @@ export class PivotEngine {
     this.app.stage.addChild(this.root);
     // The item-frame layer also paints the shop tray. Keep it below item sprites so
     // the tray never masks the traps it is meant to present.
-    this.root.addChild(this.backgroundLayer, this.terrainLayer, this.fogLayer, this.boardLayer, this.itemFrameLayer, this.tierArtLayer, this.itemLayer, this.routeLayer, this.portalLayer, this.enemyLayer, this.fxLayer, this.labelLayer);
+    this.root.addChild(this.backgroundLayer, this.terrainLayer, this.fogLayer, this.boardLayer, this.itemFrameLayer, this.itemLayer, this.tierBadgeLayer, this.routeLayer, this.portalLayer, this.enemyLayer, this.fxLayer, this.labelLayer);
     this.itemLayer.sortableChildren = true;
     this.portalLayer.addChild(this.portalGraphics);
     this.app.canvas.addEventListener('pointerdown', this.onPointerDown);
@@ -353,7 +368,7 @@ export class PivotEngine {
     const queue: { kind: EnemyKind; entrance: number }[] = [];
     const longest = Math.max(...groups.map(group => group.length));
     for (let row = 0; row < longest; row++) groups.forEach((group, entrance) => { if (group[row]) queue.push({ kind: group[row], entrance }); });
-    const hpScale = 1 + Math.pow((this.wave - 1) / 9, 1.55) * 2.15;
+    const hpScale = enemyHpScale(this.wave);
     queue.forEach(({ kind, entrance }, index) => {
       const def = ENEMIES[kind], point = spawnPoints[entrance] ?? entrances[entrance];
       this.spawnQueue.push({
@@ -793,7 +808,11 @@ export class PivotEngine {
     if (recovering) enemy.hardControlImmune = 1;
     const laneBias = recovering ? 0 : enemy.laneBias;
     const progressWeight = 1.15 + Math.min(3.85, enemy.noProgressTime * 1.35);
-    const candidates = dirs.map(dir => ({ x: cx + dir.x, y: cy + dir.y, dir })).filter(p => Number.isFinite(field[p.y]?.[p.x]) && (recovering ? field[p.y][p.x] < current : field[p.y][p.x] <= current + 1));
+    // A very short exploration window lets a horde occupy side pockets, but it
+    // closes well before a hesitation becomes visible. From then on every
+    // chosen cell must make real flow progress.
+    const exploring = !recovering && enemy.noProgressTime < .75;
+    const candidates = dirs.map(dir => ({ x: cx + dir.x, y: cy + dir.y, dir })).filter(p => Number.isFinite(field[p.y]?.[p.x]) && (field[p.y][p.x] < current || (exploring && field[p.y][p.x] <= current + 1)));
     const scored = candidates.map(candidate => {
       const key = `${candidate.x},${candidate.y}`;
       const flow = field[candidate.y][candidate.x] * progressWeight;
@@ -816,6 +835,9 @@ export class PivotEngine {
     enemy.vy += (steered.y * speed - enemy.vy) * Math.min(1, dt * 6);
     enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt;
     this.resolveTrapObstacleCollision(enemy);
+    // Obstacle avoidance can push toward a wall, so terrain is deliberately
+    // resolved last and remains the authoritative movement boundary.
+    this.resolveTerrainCollision(enemy);
   }
 
   private obstacleCenters() {
@@ -851,9 +873,10 @@ export class PivotEngine {
       }).filter(value => value.along > -4 && value.along < value.clearance + 58 && value.perpendicular < value.clearance + 22)
         .sort((a, b) => a.along - b.along)[0];
       if (obstacle) {
-        // Alternating the persistent side distributes a dense horde instead
-        // of letting its shared flow target collapse everyone into one queue.
-        const side = ((enemy.id + Math.round((enemy.laneBias + 1) * 7)) & 1) ? -1 : 1;
+        // Prefer an open arc around wall-adjacent turrets. Alternation remains
+        // the tie-breaker when both sides are genuinely traversable.
+        const fallback = ((enemy.id + Math.round((enemy.laneBias + 1) * 7)) & 1) ? -1 : 1;
+        const side = this.openObstacleSide(enemy, obstacle, fallback);
         avoidance = { itemId: obstacle.itemId, side }; this.obstacleAvoidance.set(enemy.id, avoidance);
       }
     }
@@ -867,6 +890,18 @@ export class PivotEngine {
     let y = directionY * (1 - weight * .78) + tangentY * weight * 1.18 + radialY * weight * .3;
     const length = Math.hypot(x, y) || 1;
     return { x: x / length, y: y / length };
+  }
+
+  private openObstacleSide(enemy: EnemyState, obstacle: { x: number; y: number; radius: number }, fallback: -1 | 1): -1 | 1 {
+    const dx = enemy.x - obstacle.x, dy = enemy.y - obstacle.y, angle = Math.atan2(dy, dx);
+    const orbitRadius = obstacle.radius + ENEMIES[enemy.kind].radius + 2;
+    const score = (side: -1 | 1) => [.32, .64, .96, 1.28].reduce((total, step) => {
+      const sampleAngle = angle + side * step;
+      const x = obstacle.x + Math.cos(sampleAngle) * orbitRadius, y = obstacle.y + Math.sin(sampleAngle) * orbitRadius;
+      return total + (this.isTerrainClear(x, y, ENEMIES[enemy.kind].radius) ? 1 : 0);
+    }, 0);
+    const fallbackScore = score(fallback), opposite = -fallback as -1 | 1, oppositeScore = score(opposite);
+    return oppositeScore > fallbackScore ? opposite : fallback;
   }
 
   private resolveTrapObstacleCollision(enemy: EnemyState) {
@@ -910,20 +945,17 @@ export class PivotEngine {
   }
 
   private crowdMove(enemy: EnemyState, dx: number, dy: number) {
-    const before = { x: enemy.x, y: enemy.y };
     enemy.x += dx; enemy.y += dy;
-    const cx = Math.floor((enemy.x - BOARD_X) / CELL), cy = Math.floor((enemy.y - BOARD_Y) / CELL);
-    const passable = this.revealedFloorSet.has(`${cx},${cy}`) || (cx >= this.stage.heartOrigin.x && cx < this.stage.heartOrigin.x + 2 && cy >= this.stage.heartOrigin.y && cy < this.stage.heartOrigin.y + 2);
-    if (!passable) { enemy.x = before.x; enemy.y = before.y; }
-    else this.resolveTrapObstacleCollision(enemy);
+    this.resolveTrapObstacleCollision(enemy);
+    this.resolveTerrainCollision(enemy);
   }
 
   private resolveCrowd(dt: number) {
     this.rebuildCrowdBuckets();
-    for (const a of this.enemies) if (!a.dead && a.spawnDelay <= 0) {
+    for (const a of this.enemies) if (!a.dead && a.spawnDelay <= 0 && !a.emerging) {
       const bx = Math.floor(a.x / CELL), by = Math.floor(a.y / CELL);
       for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) for (const b of this.crowdBuckets.get(`${bx + ox},${by + oy}`) ?? []) {
-        if (b.id <= a.id) continue;
+        if (b.id <= a.id || b.emerging) continue;
         const dx = b.x - a.x, dy = b.y - a.y, min = (ENEMIES[a.kind].radius + ENEMIES[b.kind].radius) * .96, distance2 = dx * dx + dy * dy;
         if (distance2 >= min * min) continue;
         const d = Math.sqrt(distance2) || .1, force = (min - d) * Math.min(.6, dt * 12), nx = dx / d, ny = dy / d;
@@ -936,12 +968,57 @@ export class PivotEngine {
     }
   }
 
+  private terrainCellPassable(x: number, y: number, floor: ReadonlySet<string>) {
+    return x >= 0 && y >= 0 && x < COLS && y < ROWS && (floor.has(`${x},${y}`) || this.stage.fullGrid[y][x] === 'heart');
+  }
+
+  private isTerrainClear(x: number, y: number, radius: number) {
+    if (x - radius < BOARD_X || y - radius < BOARD_Y || x + radius > BOARD_X + BOARD_W || y + radius > BOARD_Y + BOARD_H) return false;
+    const floor = this.revealedFloorSet;
+    const minX = Math.max(0, Math.floor((x - radius - BOARD_X) / CELL)), maxX = Math.min(COLS - 1, Math.floor((x + radius - BOARD_X) / CELL));
+    const minY = Math.max(0, Math.floor((y - radius - BOARD_Y) / CELL)), maxY = Math.min(ROWS - 1, Math.floor((y + radius - BOARD_Y) / CELL));
+    for (let cy = minY; cy <= maxY; cy++) for (let cx = minX; cx <= maxX; cx++) {
+      if (this.terrainCellPassable(cx, cy, floor)) continue;
+      const left = BOARD_X + cx * CELL, top = BOARD_Y + cy * CELL;
+      const closestX = clamp(x, left, left + CELL), closestY = clamp(y, top, top + CELL);
+      if ((x - closestX) ** 2 + (y - closestY) ** 2 < radius ** 2 - .001) return false;
+    }
+    return true;
+  }
+
   private resolveTerrainCollision(enemy: EnemyState) {
-    const cx = Math.floor((enemy.x - BOARD_X) / CELL), cy = Math.floor((enemy.y - BOARD_Y) / CELL);
-    const passable = cx >= 0 && cy >= 0 && cx < COLS && cy < ROWS && (this.revealedFloorSet.has(`${cx},${cy}`) || this.stage.fullGrid[cy][cx] === 'heart');
-    if (!passable) {
-      enemy.x -= enemy.vx * .04; enemy.y -= enemy.vy * .04; enemy.vx *= -.25; enemy.vy *= -.25; enemy.impulseTime = 0;
-      if (enemy.launched && !enemy.collisionSpent) { this.damageEnemy(enemy, 28, this.itemById(enemy.impulseSourceId)); enemy.collisionSpent = true; this.bursts.push({ x: enemy.x, y: enemy.y, age: 0, life: .35, size: 34, color: 0xf0c56d, kind: 'ring' }); }
+    const radius = ENEMIES[enemy.kind].radius, floor = this.revealedFloorSet;
+    let collided = false;
+    enemy.x = clamp(enemy.x, BOARD_X + radius, BOARD_X + BOARD_W - radius);
+    enemy.y = clamp(enemy.y, BOARD_Y + radius, BOARD_Y + BOARD_H - radius);
+    for (let pass = 0; pass < 3; pass++) {
+      let corrected = false;
+      const minX = Math.max(0, Math.floor((enemy.x - radius - BOARD_X) / CELL)), maxX = Math.min(COLS - 1, Math.floor((enemy.x + radius - BOARD_X) / CELL));
+      const minY = Math.max(0, Math.floor((enemy.y - radius - BOARD_Y) / CELL)), maxY = Math.min(ROWS - 1, Math.floor((enemy.y + radius - BOARD_Y) / CELL));
+      for (let cy = minY; cy <= maxY; cy++) for (let cx = minX; cx <= maxX; cx++) {
+        if (this.terrainCellPassable(cx, cy, floor)) continue;
+        const left = BOARD_X + cx * CELL, top = BOARD_Y + cy * CELL;
+        const closestX = clamp(enemy.x, left, left + CELL), closestY = clamp(enemy.y, top, top + CELL);
+        let dx = enemy.x - closestX, dy = enemy.y - closestY, distanceToWall = Math.hypot(dx, dy), push = radius - distanceToWall + .01;
+        if (distanceToWall >= radius) continue;
+        if (distanceToWall < .001) {
+          const exits = [
+            { distance: enemy.x - left, nx: -1, ny: 0 }, { distance: left + CELL - enemy.x, nx: 1, ny: 0 },
+            { distance: enemy.y - top, nx: 0, ny: -1 }, { distance: top + CELL - enemy.y, nx: 0, ny: 1 },
+          ].sort((a, b) => a.distance - b.distance);
+          dx = exits[0].nx; dy = exits[0].ny; distanceToWall = 1; push = exits[0].distance + radius + .01;
+        }
+        const nx = dx / distanceToWall, ny = dy / distanceToWall;
+        enemy.x += nx * push; enemy.y += ny * push;
+        const inwardSpeed = enemy.vx * nx + enemy.vy * ny;
+        if (inwardSpeed < 0) { enemy.vx -= inwardSpeed * nx; enemy.vy -= inwardSpeed * ny; }
+        corrected = true; collided = true;
+      }
+      if (!corrected) break;
+    }
+    if (collided && enemy.launched) {
+      enemy.impulseTime = 0;
+      if (!enemy.collisionSpent) { this.damageEnemy(enemy, 28, this.itemById(enemy.impulseSourceId)); enemy.collisionSpent = true; this.bursts.push({ x: enemy.x, y: enemy.y, age: 0, life: .35, size: 34, color: 0xf0c56d, kind: 'ring' }); }
     }
   }
 
@@ -1258,7 +1335,8 @@ export class PivotEngine {
   }
 
   private drawItems() {
-    const centers = this.itemCenters(), used = new Set<string>(), usedTurretBases = new Set<string>(), usedTurretHeads = new Set<string>(); this.itemFrameLayer.clear();
+    const centers = this.itemCenters(), used = new Set<string>(), usedTurretBases = new Set<string>(), usedTurretHeads = new Set<string>();
+    this.itemFrameLayer.clear(); this.tierBadgeLayer.clear();
     const draggedItem = this.drag ? this.items.find(item => item.id === this.drag!.itemId) ?? null : null;
     const zoneCoverage = draggedItem && this.drag?.boardOrigin ? new Set(this.zoneCells(draggedItem, this.drag.boardOrigin).map(pkey)) : new Set<string>();
     const trayOffset = this.shopSlide * (HEIGHT - SHOP_Y + 24);
@@ -1304,6 +1382,7 @@ export class PivotEngine {
       const rotatingId = rotatingTurretIds.includes(def.id as RotatingTurretId) ? def.id as RotatingTurretId : null;
       const combatParts = rotatingId ? this.combatTurretTextures[rotatingId] : null;
       const articulated = !!(this.phase === 'combat' && item.location === 'board' && item.origin && def.turret && rotatingId && combatParts);
+      const tierFilters = this.phase === 'combat' ? null : this.tierFilters[item.tier];
       if (texture && !articulated) {
         let sprite = this.segmentSprites.get(spriteKey);
         if (!sprite) { sprite = new Sprite(texture); sprite.anchor.set(.5); this.segmentSprites.set(spriteKey, sprite); this.itemLayer.addChild(sprite); }
@@ -1311,7 +1390,7 @@ export class PivotEngine {
         const activePulse = Math.max(0, ...def.shape.map((_, index) => this.segmentPulse.get(`${item.id}:${index}`) ?? 0));
         const pulseScale = activePulse > 0 ? 1 + Math.sin((.28 - activePulse) * 34) * .07 : 1;
         sprite.width = (maxX + 1) * unit * .86 * pulseScale; sprite.height = (maxY + 1) * unit * .86 * pulseScale;
-        sprite.rotation = activePulse > 0 ? Math.sin((.28 - activePulse) * 38) * (def.element === 'Water' ? .06 : .025) : 0;
+        sprite.rotation = activePulse > 0 ? Math.sin((.28 - activePulse) * 38) * (def.element === 'Water' ? .06 : .025) : 0; sprite.filters = tierFilters;
         sprite.alpha = isDragged ? .96 : this.phase === 'combat' ? .62 : 1; sprite.tint = flash ? flash.color : 0xffffff;
       }
       if (articulated && def.turret && rotatingId && combatParts && item.origin) {
@@ -1319,14 +1398,14 @@ export class PivotEngine {
         let base = this.turretBaseSprites.get(item.id);
         if (!base) { base = new Sprite(combatParts.base); this.turretBaseSprites.set(item.id, base); this.itemLayer.addChild(base); }
         usedTurretBases.add(item.id); base.visible = true; base.texture = combatParts.base; base.anchor.set(art.baseAnchor.x, art.baseAnchor.y);
-        base.x = basePoint.x; base.y = basePoint.y; base.width = art.baseSize.x; base.height = art.baseSize.y; base.alpha = .9; base.tint = flash ? flash.color : 0xffffff; base.zIndex = 1;
+        base.x = basePoint.x; base.y = basePoint.y; base.width = art.baseSize.x; base.height = art.baseSize.y; base.alpha = .9; base.tint = flash ? flash.color : 0xffffff; base.filters = tierFilters; base.zIndex = 1;
         let head = this.turretHeadSprites.get(item.id);
         if (!head) { head = new Sprite(combatParts.head); this.turretHeadSprites.set(item.id, head); this.itemLayer.addChild(head); }
         const angle = this.turretAngles.get(item.id) ?? 0, recoilAge = this.turretRecoil.get(item.id) ?? 0;
         const recoil = recoilAge > 0 ? Math.sin((.14 - recoilAge) / .14 * Math.PI) * 4 : 0;
         usedTurretHeads.add(item.id); head.visible = true; head.texture = combatParts.head; head.anchor.set(art.headAnchor.x, art.headAnchor.y);
         head.x = pivot.x - Math.cos(angle) * recoil; head.y = pivot.y - Math.sin(angle) * recoil; head.rotation = angle;
-        head.width = art.headSize.x; head.height = art.headSize.y; head.alpha = .96; head.tint = flash ? flash.color : 0xffffff; head.zIndex = 2;
+        head.width = art.headSize.x; head.height = art.headSize.y; head.alpha = .96; head.tint = flash ? flash.color : 0xffffff; head.filters = tierFilters; head.zIndex = 2;
       }
       for (let index = 0; index < def.shape.length; index++) {
         const offset = def.shape[index], pulse = this.segmentPulse.get(`${item.id}:${index}`) ?? 0;
@@ -1337,7 +1416,11 @@ export class PivotEngine {
           .stroke({ color: def.accent, width: 1, alpha: .2 });
       }
       const stars = item.tier === 1 ? 0 : item.tier === 2 ? 2 : 3;
-      for (let star = 0; star < stars; star++) this.itemFrameLayer.star(center.x + (star - (stars - 1) / 2) * unit * .18, originY + unit * .15, unit * .1, 5, .46).fill({ color: 0xffd56d, alpha: .98 });
+      const starRadius = Math.max(10, unit * .14), starGap = starRadius * 2.12, starY = originY + starRadius * .9;
+      for (let star = 0; star < stars; star++) {
+        const starX = center.x + (star - (stars - 1) / 2) * starGap;
+        drawTierStar(this.tierBadgeLayer, starX, starY, starRadius);
+      }
       const zoneMatched = !!(draggedItem && item.id !== draggedItem.id && item.origin && def.shape.some(offset => zoneCoverage.has(`${item.origin!.x + offset.x},${item.origin!.y + offset.y}`)));
       if (zoneMatched) {
         const width = (maxX + 1) * unit, height = (maxY + 1) * unit;

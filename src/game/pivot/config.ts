@@ -44,8 +44,17 @@ export function trapActivationOffsets(def: TrapDef) {
 }
 export const ENEMIES: Record<EnemyKind, EnemyDef> = { grunt: { id: 'grunt', name: 'Grunt', hp: 80, speed: 65, radius: 10, mass: 1, heartDamage: 1, color: 0xe8d9b0, accent: 0xaec5dc }, runner: { id: 'runner', name: 'Runner', hp: 55, speed: 85, radius: 8, mass: .7, heartDamage: 1, color: 0xf5e6b6, accent: 0xe76d55 }, flyer: { id: 'flyer', name: 'Flyer', hp: 115, speed: 62, radius: 11, mass: .8, heartDamage: 2, color: 0xe7d7bf, accent: 0xb45b8f, flying: true }, shieldbearer: { id: 'shieldbearer', name: 'Shieldbearer', hp: 220, speed: 40, radius: 13, mass: 2.3, heartDamage: 3, color: 0xcabf9d, accent: 0x4e79a7 }, brute: { id: 'brute', name: 'Brute', hp: 400, speed: 35, radius: 18, mass: 4.5, heartDamage: 4, color: 0x938ba1, accent: 0xc6b06b } };
 export const ARCHETYPES = [{ name: 'Crimson Fang Rift', archetype: 'Green Tide', tagline: 'A dense horde. Area damage thrives.', bias: 'grunt' }, { name: 'Well of Slippery Oaths', archetype: 'Slippery Ledge', tagline: 'Fast enemies test every gap.', bias: 'runner' }, { name: 'Iron March Dungeons', archetype: 'Iron March', tagline: 'Armor advances in measured ranks.', bias: 'shieldbearer' }, { name: 'Grotto of Ashen Wings', archetype: 'Winged Cavern', tagline: 'Flying foes test your target selection.', bias: 'flyer' }, { name: 'Four Maws of the Abyss', archetype: 'All-Sides Siege', tagline: 'Threats arrive from every frontier.', bias: 'mixed' }] as const;
+const waveProgress = (wave: number) => Math.max(0, Math.min(1, (wave - 1) / 9));
+
+export function enemyHpScale(wave: number) {
+  const progress = waveProgress(wave);
+  const previousScale = 1 + Math.pow(progress, 1.55) * 2.15;
+  return previousScale * (1 + progress * .25);
+}
+
 export function buildWavePreview(archetype: string, wave: number): Record<EnemyKind, number> {
-  const special = Math.floor(6 + wave * 5), total = 24 + wave * 25;
+  const countScale = 1.2 + waveProgress(wave) * .8;
+  const special = Math.floor((6 + wave * 5) * countScale), total = Math.round((24 + wave * 25) * countScale);
   const result: Record<EnemyKind, number> = { grunt: total, runner: 0, flyer: 0, shieldbearer: 0, brute: 0 };
   if (wave < 2) return result;
 

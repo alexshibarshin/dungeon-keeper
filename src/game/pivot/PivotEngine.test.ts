@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { BOARD_X, BOARD_Y, CELL, EXPAND_PRICES, STARTING_COINS, TRAPS } from './config';
+import { BOARD_X, BOARD_Y, CELL, ENEMIES, EXPAND_PRICES, STARTING_COINS, TRAPS } from './config';
 import { activeFlowGates, buildFlowField, simulateTraffic } from './generator';
 import { PivotEngine } from './PivotEngine';
 import type { EnemyKind, EnemyState, Point, TrapId, TrapItem } from './types';
@@ -335,5 +335,27 @@ describe('pivot preparation loop', () => {
       (engine as unknown as { updateCombat: (dt: number) => void }).updateCombat(.04);
     expect(engine.phase).toBe('perk');
     expect(engine.stats.leaked).toBeGreaterThan(0);
+  });
+
+  it('keeps a horde out of the center wall while rounding the wall-adjacent upper turret', () => {
+    // four-horns, reveal 1: this is the exact concave passage shown in the
+    // regression screenshot. The wall at 3,8 borders the turret route at 4,6.
+    const engine = new PivotEngine(987655, () => undefined);
+    engine.expandCount = 1;
+    engine.flow = buildFlowField(engine.stage, engine.expandCount);
+    engine.flyFlow = buildFlowField(engine.stage, engine.expandCount, true);
+    engine.gateFlows = activeFlowGates(engine.stage, engine.expandCount).map(gate => buildFlowField(engine.stage, engine.expandCount, false, gate));
+    engine.routeSimulation = simulateTraffic(engine.stage, engine.expandCount);
+    const turret: TrapItem = { id: 'wall-adjacent-icicle', trapId: 'icicle', tier: 1, location: 'board', origin: { x: 4, y: 6 }, cooldowns: [999] };
+    engine.items = [turret]; engine.battle();
+    const terrain = engine as unknown as { updateCombat: (dt: number) => void; isTerrainClear: (x: number, y: number, radius: number) => boolean };
+    let breachedWall = false;
+    for (let tick = 0; tick < 3_000 && engine.phase === 'combat'; tick++) {
+      terrain.updateCombat(.04);
+      for (const enemy of engine.enemies) if (!enemy.dead && enemy.spawnDelay <= 0 && !enemy.emerging && enemy.kind !== 'flyer')
+        breachedWall ||= !terrain.isTerrainClear(enemy.x, enemy.y, ENEMIES[enemy.kind].radius);
+    }
+    expect(breachedWall).toBe(false);
+    expect(engine.phase).toBe('perk');
   });
 });
