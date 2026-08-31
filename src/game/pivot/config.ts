@@ -12,8 +12,7 @@ export const RECYCLER_TARGETS = [2, 4, 6, 8, 10, 12] as const;
 export const FLOOR_TARGETS = { tight: 42, standard: 46, roomy: 50 } as const;
 export const FINAL_FLOOR_TARGET = FLOOR_TARGETS.standard, INITIAL_FLOOR_TARGET = 20;
 export const REVEAL_CHUNK_SIZES = [7, 7, 6, 6] as const;
-export const FLOW_LANE_SPREAD = 24, FLOW_DENSITY_AVOIDANCE = .8;
-export const CONTROL_TUNING = { diminishingReturns: [1, .6, .3, 0] as const, sequenceWindow: 3, immunityDuration: 2, noProgressTimeout: 6, impulseDuration: .34, slowStrength: .35, slowDuration: 2, burnDuration: 3 } as const;
+export const CONTROL_TUNING = { diminishingReturns: [1, .6, .3, 0] as const, sequenceWindow: 3, immunityDuration: 2, noProgressTimeout: 2, impulseDuration: .34, slowStrength: .35, slowDuration: 2, burnDuration: 3 } as const;
 const shape = (...cells: [number, number][]): Point[] => cells.map(([x, y]) => ({ x, y }));
 const floor = (value: Omit<TrapDef, 'placement'>): TrapDef => ({ ...value, placement: 'floor' });
 

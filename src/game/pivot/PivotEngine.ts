@@ -1,7 +1,7 @@
 import { Application, Assets, Container, Graphics, Rectangle, Sprite, Text, TextStyle, Texture } from 'pixi.js';
 import type { Filter } from 'pixi.js';
 import {
-  BOARD_H, BOARD_W, BOARD_X, BOARD_Y, CELL, COLS, CONTROL_TUNING, ENEMIES, EXPAND_PRICES, FLOW_DENSITY_AVOIDANCE, FLOW_LANE_SPREAD, HEIGHT, HEART_HP, PERKS,
+  BOARD_H, BOARD_W, BOARD_X, BOARD_Y, CELL, COLS, CONTROL_TUNING, ENEMIES, EXPAND_PRICES, HEIGHT, HEART_HP, PERKS,
   RECYCLER_TARGETS, REROLL_PRICES, ROWS, SHOP_Y, STARTING_COINS, TIER_DAMAGE, TIER_ZONE, TRAPS, TRAP_IDS,
   WAVE_CONFIG, WAVE_INCOME, WIDTH, buildWavePreview, trapActivationOffsets,
 } from './config';
@@ -11,6 +11,8 @@ import type {
   DungeonStage, EnemyKind, EnemyState, GameSnapshot, PerkDef, Point, RunStats, TrapDef, TrapId, TrapItem, TrapTag, TrapTier,
 } from './types';
 import { createTierOutlineFilter } from './TierOutlineFilter';
+import { CrowdFlow } from './CrowdFlow';
+import type { CrowdFlowWorld } from './CrowdFlow';
 
 type DragOrigin = { location: TrapItem['location']; origin?: Point; index?: number };
 type DragState = { itemId: string; grab: Point; origin: DragOrigin; x: number; y: number; boardOrigin: Point | null; valid: boolean };
@@ -161,9 +163,7 @@ export class PivotEngine {
   projectiles: Projectile[] = [];
   zonePops: ZonePop[] = [];
   segmentPulse = new Map<string, number>();
-  trafficHeat = new Map<string, number>();
-  trafficCoverage = new Map<string, number>();
-  crowdBuckets = new Map<string, EnemyState[]>();
+  crowdFlow = new CrowdFlow();
   routeSimulation: TrafficSimulation;
   damagePops = new Map<number, DamagePop>();
   boardFlash = new Map<string, { age: number; color: number }>();
@@ -186,7 +186,6 @@ export class PivotEngine {
   recycleFlights: RecycleFlight[] = [];
   turretAngles = new Map<string, number>();
   turretRecoil = new Map<string, number>();
-  obstacleAvoidance = new Map<number, { itemId: string; side: -1 | 1 }>();
   tierFilters: Record<TrapTier, Filter[] | null> = { 1: null, 2: null, 3: null };
 
   constructor(seed: number, onSnapshot: (snapshot: GameSnapshot) => void, stage = generateDungeon(seed)) {
@@ -402,7 +401,7 @@ export class PivotEngine {
   battle() {
     if (this.phase !== 'prep' || this.drag) return;
     this.recycleShop();
-    this.phase = 'combat'; this.paused = false; this.enemies = []; this.spawnQueue = []; this.trafficHeat.clear(); this.trafficCoverage.clear(); this.obstacleAvoidance.clear();
+    this.phase = 'combat'; this.paused = false; this.enemies = []; this.spawnQueue = []; this.crowdFlow.reset();
     const entrances = this.entrances, spawnPoints = this.spawnPoints, groups = this.distributedRoster();
     const queue: { kind: EnemyKind; entrance: number }[] = [];
     const longest = Math.max(...groups.map(group => group.length));
@@ -451,7 +450,7 @@ export class PivotEngine {
     const currentStage = this.stage;
     this.phase = 'prep'; this.wave = 1; this.coins = STARTING_COINS; this.hp = HEART_HP; this.maxHp = HEART_HP;
     this.expandCount = 0; this.rerollIndex = 0; this.recyclerPoints = 0; this.recyclerLevel = 0; this.freeRerolls = 0;
-    this.items = []; this.selectedPerks = []; this.perkChoices = []; this.enemies = []; this.spawnQueue = []; this.dust = []; this.recycleFlights = []; this.itemMotions.clear(); this.obstacleAvoidance.clear();
+    this.items = []; this.selectedPerks = []; this.perkChoices = []; this.enemies = []; this.spawnQueue = []; this.dust = []; this.recycleFlights = []; this.itemMotions.clear(); this.crowdFlow.reset();
     this.enemyHint = null; this.pendingRecycleId = null; this.revealFog.clear(); this.newPortalKeys.clear(); this.payoutTimer = -1; this.shopSlide = 0; this.shopSlideDelay = 0; this.message = ''; this.messageTimer = 0;
     this.stats = baseStats(); this.victory = null; this.stage = currentStage; this.flow = buildFlowField(this.stage, 0); this.flyFlow = buildFlowField(this.stage, 0, true); this.gateFlows = activeFlowGates(this.stage, 0).map(gate => buildFlowField(this.stage, 0, false, gate)); this.routeSimulation = simulateTraffic(this.stage, 0);
     this.addShopBatch(); this.drawTerrain(); this.emit();
@@ -777,12 +776,9 @@ export class PivotEngine {
   };
 
   private updateCombat(dt: number) {
-    for (const [cell, heat] of this.trafficHeat) {
-      const next = Math.max(0, heat - dt * .22);
-      if (next <= .001) this.trafficHeat.delete(cell); else this.trafficHeat.set(cell, next);
-    }
     for (const item of this.boardItems) item.cooldowns = item.cooldowns.map(value => Math.max(0, value - dt));
-    this.rebuildCrowdBuckets();
+    const crowdWorld = this.crowdWorld();
+    this.crowdFlow.prepare(this.enemies);
     for (const enemy of this.enemies) {
       if (enemy.dead) continue;
       if (enemy.spawnDelay > 0) { enemy.spawnDelay -= dt; continue; }
@@ -795,18 +791,15 @@ export class PivotEngine {
       enemy.vulnerableTime = Math.max(0, enemy.vulnerableTime - dt); if (!enemy.vulnerableTime) enemy.vulnerable = 0;
       enemy.hardControlWindow = Math.max(0, enemy.hardControlWindow - dt); enemy.hardControlImmune = Math.max(0, enemy.hardControlImmune - dt);
       if (enemy.impulseTime > 0) {
-        enemy.impulseTime -= dt; enemy.airborneTime = Math.max(0, enemy.airborneTime - dt); enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt; this.resolveTrapObstacleCollision(enemy); this.resolveTerrainCollision(enemy);
+        enemy.impulseTime -= dt; enemy.airborneTime = Math.max(0, enemy.airborneTime - dt); enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt; this.resolveTrapObstacleCollision(enemy, crowdWorld); this.resolveTerrainCollision(enemy);
         if (enemy.impulseTime <= 0) { this.triggerImpact(enemy); enemy.launched = false; enemy.impulseSourceId = null; }
         continue;
       }
-      this.steerEnemy(enemy, dt);
-      const cell = `${Math.floor((enemy.x - BOARD_X) / CELL)},${Math.floor((enemy.y - BOARD_Y) / CELL)}`;
-      this.trafficHeat.set(cell, (this.trafficHeat.get(cell) ?? 0) + dt * .12);
-      this.trafficCoverage.set(cell, (this.trafficCoverage.get(cell) ?? 0) + dt);
+      this.steerEnemy(enemy, dt, crowdWorld);
       this.checkLeak(enemy);
       if (this.phase === 'result') return;
     }
-    this.resolveCrowd(dt);
+    this.resolveCrowd(dt, crowdWorld);
     this.updateTurretAim(dt);
     this.activateTraps();
     this.updateHeart(dt);
@@ -824,7 +817,7 @@ export class PivotEngine {
     enemy.impactDamage = 0; enemy.impactRadius = 0; enemy.impactSourceId = null;
   }
 
-  private steerEnemy(enemy: EnemyState, dt: number) {
+  private steerEnemy(enemy: EnemyState, dt: number, world = this.crowdWorld()) {
     const def = ENEMIES[enemy.kind];
     const entrance = this.entrances[enemy.entrance];
     if (entrance && enemy.emerging) {
@@ -853,38 +846,7 @@ export class PivotEngine {
     if (current < enemy.bestFlowDistance - .05) { enemy.bestFlowDistance = current; enemy.noProgressTime = 0; } else enemy.noProgressTime += dt;
     const recovering = enemy.noProgressTime > CONTROL_TUNING.noProgressTimeout;
     if (recovering) enemy.hardControlImmune = 1;
-    const laneBias = recovering ? 0 : enemy.laneBias;
-    const progressWeight = 1.15 + Math.min(3.85, enemy.noProgressTime * 1.35);
-    // A very short exploration window lets a horde occupy side pockets, but it
-    // closes well before a hesitation becomes visible. From then on every
-    // chosen cell must make real flow progress.
-    const exploring = !recovering && enemy.noProgressTime < .75;
-    const candidates = dirs.map(dir => ({ x: cx + dir.x, y: cy + dir.y, dir })).filter(p => Number.isFinite(field[p.y]?.[p.x]) && (field[p.y][p.x] < current || (exploring && field[p.y][p.x] <= current + 1)));
-    const scored = candidates.map(candidate => {
-      const key = `${candidate.x},${candidate.y}`;
-      const flow = field[candidate.y][candidate.x] * progressWeight;
-      const density = this.localDensity(BOARD_X + (candidate.x + .5) * CELL, BOARD_Y + (candidate.y + .5) * CELL, enemy.id) * FLOW_DENSITY_AVOIDANCE;
-      const heat = (this.trafficHeat.get(key) ?? 0) * 2.2;
-      // Shared per-wave coverage pressure makes a large horde occupy side
-      // pockets of a room before it reconverges, instead of merely drawing a
-      // wider version of the shortest path.
-      const coverage = (this.trafficCoverage.get(key) ?? 0) * 3.2;
-      const lateral = (candidate.dir.x - candidate.dir.y) * laneBias * .45;
-      return { candidate, score: recovering ? flow : flow + density + heat + coverage - lateral };
-    }).sort((a, b) => a.score - b.score);
-    const next = scored[0]?.candidate ?? { x: cx, y: cy, dir: { x: 0, y: -1 } };
-    const tx = BOARD_X + (next.x + .5) * CELL - next.dir.y * laneBias * FLOW_LANE_SPREAD;
-    const ty = BOARD_Y + (next.y + .5) * CELL + next.dir.x * laneBias * FLOW_LANE_SPREAD;
-    const dx = tx - enemy.x, dy = ty - enemy.y, length = Math.hypot(dx, dy) || 1, slow = enemy.slowTime > 0 ? 1 - enemy.slow : 1;
-    const steered = this.steerAroundTrapObstacles(enemy, dx / length, dy / length);
-    const speed = def.speed * slow;
-    enemy.vx += (steered.x * speed - enemy.vx) * Math.min(1, dt * 6);
-    enemy.vy += (steered.y * speed - enemy.vy) * Math.min(1, dt * 6);
-    enemy.x += enemy.vx * dt; enemy.y += enemy.vy * dt;
-    this.resolveTrapObstacleCollision(enemy);
-    // Obstacle avoidance can push toward a wall, so terrain is deliberately
-    // resolved last and remains the authoritative movement boundary.
-    this.resolveTerrainCollision(enemy);
+    this.crowdFlow.move(enemy, dt, field, world);
   }
 
   private obstacleCenters() {
@@ -900,119 +862,26 @@ export class PivotEngine {
     });
   }
 
-  private steerAroundTrapObstacles(enemy: EnemyState, directionX: number, directionY: number) {
-    if (ENEMIES[enemy.kind].flying) return { x: directionX, y: directionY };
-    const obstacles = this.obstacleCenters();
-    let avoidance = this.obstacleAvoidance.get(enemy.id);
-    let obstacle = avoidance ? obstacles.find(value => value.itemId === avoidance!.itemId) : undefined;
-    if (obstacle && avoidance) {
-      const toX = obstacle.x - enemy.x, toY = obstacle.y - enemy.y, distanceToCenter = Math.hypot(toX, toY) || .001;
-      const ahead = (directionX * toX + directionY * toY) / distanceToCenter;
-      const clearance = obstacle.radius + ENEMIES[enemy.kind].radius;
-      if (ahead < -.3 && distanceToCenter > clearance + 10) { this.obstacleAvoidance.delete(enemy.id); avoidance = undefined; obstacle = undefined; }
-    }
-    if (!obstacle) {
-      obstacle = obstacles.map(value => {
-        const toX = value.x - enemy.x, toY = value.y - enemy.y, along = directionX * toX + directionY * toY;
-        const perpendicular = Math.abs(directionX * toY - directionY * toX);
-        const clearance = value.radius + ENEMIES[enemy.kind].radius;
-        return { ...value, along, perpendicular, clearance };
-      }).filter(value => value.along > -4 && value.along < value.clearance + 58 && value.perpendicular < value.clearance + 22)
-        .sort((a, b) => a.along - b.along)[0];
-      if (obstacle) {
-        // Prefer an open arc around wall-adjacent turrets. Alternation remains
-        // the tie-breaker when both sides are genuinely traversable.
-        const fallback = ((enemy.id + Math.round((enemy.laneBias + 1) * 7)) & 1) ? -1 : 1;
-        const side = this.openObstacleSide(enemy, obstacle, fallback);
-        avoidance = { itemId: obstacle.itemId, side }; this.obstacleAvoidance.set(enemy.id, avoidance);
-      }
-    }
-    if (!obstacle || !avoidance) return { x: directionX, y: directionY };
-    const radialXRaw = enemy.x - obstacle.x, radialYRaw = enemy.y - obstacle.y, distanceToCenter = Math.hypot(radialXRaw, radialYRaw) || .001;
-    const radialX = radialXRaw / distanceToCenter, radialY = radialYRaw / distanceToCenter;
-    const tangentX = -radialY * avoidance.side, tangentY = radialX * avoidance.side;
-    const clearance = obstacle.radius + ENEMIES[enemy.kind].radius, influence = clearance + 58;
-    const weight = clamp((influence - distanceToCenter) / Math.max(1, influence - clearance), .22, 1);
-    let x = directionX * (1 - weight * .78) + tangentX * weight * 1.18 + radialX * weight * .3;
-    let y = directionY * (1 - weight * .78) + tangentY * weight * 1.18 + radialY * weight * .3;
-    const length = Math.hypot(x, y) || 1;
-    return { x: x / length, y: y / length };
+  private resolveTrapObstacleCollision(enemy: EnemyState, world = this.crowdWorld()) {
+    this.crowdFlow.resolveObstacleCollision(enemy, world);
   }
 
-  private openObstacleSide(enemy: EnemyState, obstacle: { x: number; y: number; radius: number }, fallback: -1 | 1): -1 | 1 {
-    const dx = enemy.x - obstacle.x, dy = enemy.y - obstacle.y, angle = Math.atan2(dy, dx);
-    const orbitRadius = obstacle.radius + ENEMIES[enemy.kind].radius + 2;
-    const score = (side: -1 | 1) => [.32, .64, .96, 1.28].reduce((total, step) => {
-      const sampleAngle = angle + side * step;
-      const x = obstacle.x + Math.cos(sampleAngle) * orbitRadius, y = obstacle.y + Math.sin(sampleAngle) * orbitRadius;
-      return total + (this.isTerrainClear(x, y, ENEMIES[enemy.kind].radius) ? 1 : 0);
-    }, 0);
-    const fallbackScore = score(fallback), opposite = -fallback as -1 | 1, oppositeScore = score(opposite);
-    return oppositeScore > fallbackScore ? opposite : fallback;
-  }
-
-  private resolveTrapObstacleCollision(enemy: EnemyState) {
-    if (ENEMIES[enemy.kind].flying) return;
-    for (let pass = 0; pass < 2; pass++) for (const obstacle of this.obstacleCenters()) {
-      let dx = enemy.x - obstacle.x, dy = enemy.y - obstacle.y, distanceToCenter = Math.hypot(dx, dy);
-      const clearance = obstacle.radius + ENEMIES[enemy.kind].radius;
-      if (distanceToCenter >= clearance) continue;
-      if (distanceToCenter < .001) {
-        const velocityLength = Math.hypot(enemy.vx, enemy.vy) || 1, side = this.obstacleAvoidance.get(enemy.id)?.side ?? ((enemy.id & 1) ? -1 : 1);
-        dx = -enemy.vy / velocityLength * side; dy = enemy.vx / velocityLength * side; distanceToCenter = 1;
-      }
-      const push = clearance - distanceToCenter + .25, nx = dx / distanceToCenter, ny = dy / distanceToCenter;
-      enemy.x += nx * push; enemy.y += ny * push;
-      const side = this.obstacleAvoidance.get(enemy.id)?.side ?? ((enemy.id & 1) ? -1 : 1);
-      const tangentX = -ny * side, tangentY = nx * side;
-      const normalSpeed = Math.max(0, enemy.vx * nx + enemy.vy * ny);
-      const tangentSpeed = Math.max(ENEMIES[enemy.kind].speed * .28, enemy.vx * tangentX + enemy.vy * tangentY);
-      enemy.vx = nx * normalSpeed + tangentX * tangentSpeed;
-      enemy.vy = ny * normalSpeed + tangentY * tangentSpeed;
+  private resolveCrowd(dt: number, world = this.crowdWorld()) {
+    this.crowdFlow.resolvePressure(this.enemies, dt, world);
+    // Collision damage remains a combat rule rather than a movement rule.
+    for (const a of this.enemies) if (!a.dead && a.spawnDelay <= 0 && a.launched && !a.collisionSpent) {
+      const b = this.enemies.find(other => other.id !== a.id && !other.dead && other.spawnDelay <= 0
+        && Math.hypot(other.x - a.x, other.y - a.y) < ENEMIES[a.kind].radius + ENEMIES[other.kind].radius);
+      if (b) { this.collisionDamage(a, b); a.collisionSpent = true; }
     }
   }
 
-  private localDensity(x: number, y: number, ignore: number) {
-    let count = 0;
-    const bx = Math.floor(x / CELL), by = Math.floor(y / CELL);
-    for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) for (const other of this.crowdBuckets.get(`${bx + ox},${by + oy}`) ?? []) {
-      const dx = other.x - x, dy = other.y - y;
-      if (other.id !== ignore && dx * dx + dy * dy < 68 * 68) count++;
-    }
-    return count;
-  }
-
-  private rebuildCrowdBuckets() {
-    this.crowdBuckets.clear();
-    for (const enemy of this.enemies) if (!enemy.dead && enemy.spawnDelay <= 0) {
-      const key = `${Math.floor(enemy.x / CELL)},${Math.floor(enemy.y / CELL)}`;
-      const bucket = this.crowdBuckets.get(key);
-      if (bucket) bucket.push(enemy); else this.crowdBuckets.set(key, [enemy]);
-    }
-  }
-
-  private crowdMove(enemy: EnemyState, dx: number, dy: number) {
-    enemy.x += dx; enemy.y += dy;
-    this.resolveTrapObstacleCollision(enemy);
-    this.resolveTerrainCollision(enemy);
-  }
-
-  private resolveCrowd(dt: number) {
-    this.rebuildCrowdBuckets();
-    for (const a of this.enemies) if (!a.dead && a.spawnDelay <= 0 && !a.emerging) {
-      const bx = Math.floor(a.x / CELL), by = Math.floor(a.y / CELL);
-      for (let oy = -1; oy <= 1; oy++) for (let ox = -1; ox <= 1; ox++) for (const b of this.crowdBuckets.get(`${bx + ox},${by + oy}`) ?? []) {
-        if (b.id <= a.id || b.emerging) continue;
-        const dx = b.x - a.x, dy = b.y - a.y, min = (ENEMIES[a.kind].radius + ENEMIES[b.kind].radius) * .96, distance2 = dx * dx + dy * dy;
-        if (distance2 >= min * min) continue;
-        const d = Math.sqrt(distance2) || .1, force = (min - d) * Math.min(.6, dt * 12), nx = dx / d, ny = dy / d;
-        this.crowdMove(a, -nx * force, -ny * force); this.crowdMove(b, nx * force, ny * force);
-        if ((a.launched || b.launched) && !(a.collisionSpent && b.collisionSpent)) {
-          if (a.launched && !a.collisionSpent) { this.collisionDamage(a, b); a.collisionSpent = true; }
-          if (b.launched && !b.collisionSpent) { this.collisionDamage(b, a); b.collisionSpent = true; }
-        }
-      }
-    }
+  private crowdWorld(): CrowdFlowWorld {
+    return {
+      obstacles: this.obstacleCenters(),
+      isTerrainClear: (x: number, y: number, radius: number) => this.isTerrainClear(x, y, radius),
+      resolveTerrain: (enemy: EnemyState) => { this.resolveTerrainCollision(enemy); },
+    };
   }
 
   private terrainCellPassable(x: number, y: number, floor: ReadonlySet<string>) {
@@ -1079,7 +948,7 @@ export class PivotEngine {
   private checkLeak(enemy: EnemyState) {
     const h = this.stage.heartOrigin, hx = BOARD_X + (h.x + 1) * CELL, hy = BOARD_Y + (h.y + 1) * CELL;
     if (Math.hypot(enemy.x - hx, enemy.y - hy) > CELL * .8) return;
-    enemy.dead = true; this.obstacleAvoidance.delete(enemy.id); this.hp = Math.max(0, this.hp - ENEMIES[enemy.kind].heartDamage); this.stats.leaked++; this.stats.damageTaken += ENEMIES[enemy.kind].heartDamage;
+    enemy.dead = true; this.crowdFlow.forget(enemy.id); this.hp = Math.max(0, this.hp - ENEMIES[enemy.kind].heartDamage); this.stats.leaked++; this.stats.damageTaken += ENEMIES[enemy.kind].heartDamage;
     this.bursts.push({ x: hx, y: hy, age: 0, life: .5, size: 54, color: 0xff4f67, kind: 'burst' });
     this.bursts.push({ x: enemy.x, y: enemy.y, age: 0, life: .8, size: 18, color: 0xffd45c, kind: 'coin' });
     if (this.hp <= 0) { this.phase = 'result'; this.victory = false; this.paused = true; this.emit(); }
@@ -1183,7 +1052,7 @@ export class PivotEngine {
     else this.damagePops.set(enemy.id, { x: enemy.x, y: enemy.y, damage, age: 0 });
     if (source) this.stats.trapDamage[source.trapId] = (this.stats.trapDamage[source.trapId] ?? 0) + damage;
     if (enemy.hp > 0) return;
-    enemy.dead = true; this.obstacleAvoidance.delete(enemy.id); this.stats.killed++;
+    enemy.dead = true; this.crowdFlow.forget(enemy.id); this.stats.killed++;
     this.bursts.push({ x: enemy.x, y: enemy.y, age: 0, life: .4, size: ENEMIES[enemy.kind].radius * 2.4, color: ENEMIES[enemy.kind].accent, kind: dot ? 'ring' : 'burst' });
     this.bursts.push({ x: enemy.x, y: enemy.y, age: 0, life: .8, size: 18, color: 0xffd45c, kind: 'coin' });
     if (enemy.burnTime > 0 && this.selectedMechanic('fire-death-explosion')) {

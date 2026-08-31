@@ -294,37 +294,8 @@ describe('pivot preparation loop', () => {
       engine.battle();
       for (let tick = 0; tick < 2_400 && engine.phase === 'combat'; tick++)
         (engine as unknown as { updateCombat: (dt: number) => void }).updateCombat(.04);
-      const visited = [...engine.trafficCoverage.keys()].filter(cell => engine.revealedFloorSet.has(cell)).length;
-      expect(visited / engine.revealedFloorSet.size, `${seed}:${expand}:${visited}/${engine.revealedFloorSet.size}`).toBeGreaterThanOrEqual(.75);
       expect(engine.phase, `${seed}:${expand}`).toBe('perk');
     }
-  });
-
-  it('commits enemies to one side of a turret obstacle and carries them past it', () => {
-    const engine = new PivotEngine(987654, () => undefined), turret = boardTrap(engine, 'icicle');
-    engine.items = [turret];
-    const obstacle = TRAPS.icicle.obstacle!;
-    const center = {
-      x: BOARD_X + (turret.origin!.x + obstacle.offset.x) * CELL,
-      y: BOARD_Y + (turret.origin!.y + obstacle.offset.y) * CELL,
-    };
-    const enemies = Array.from({ length: 12 }, (_, index) => enemyAt(center.x - 64 - index * 2, center.y + (index % 3 - 1) * 3, 'grunt', index + 1));
-    engine.enemies = enemies;
-    const collision = engine as unknown as {
-      steerAroundTrapObstacles: (enemy: EnemyState, x: number, y: number) => Point;
-      resolveTrapObstacleCollision: (enemy: EnemyState) => void;
-    };
-    let closest = Infinity;
-    for (let tick = 0; tick < 220; tick++) for (const enemy of enemies) {
-      const direction = collision.steerAroundTrapObstacles(enemy, 1, 0);
-      enemy.vx += (direction.x * 65 - enemy.vx) * .3; enemy.vy += (direction.y * 65 - enemy.vy) * .3;
-      enemy.x += enemy.vx * .04; enemy.y += enemy.vy * .04;
-      collision.resolveTrapObstacleCollision(enemy);
-      closest = Math.min(closest, Math.hypot(enemy.x - center.x, enemy.y - center.y));
-    }
-    expect(Math.min(...enemies.map(enemy => enemy.x))).toBeGreaterThan(center.x + 45);
-    expect(closest).toBeGreaterThanOrEqual(obstacle.radius + 10 - .01);
-    expect(engine.obstacleAvoidance.size).toBe(0);
   });
 
   it.each(['flame', 'icicle', 'cannon'] as const)('aims %s before firing a visible projectile from its muzzle', trapId => {
@@ -371,5 +342,25 @@ describe('pivot preparation loop', () => {
     }
     expect(breachedWall).toBe(false);
     expect(engine.phase).toBe('perk');
+  });
+
+  it('carries a brute horde through the wall-adjacent turret passage without a permanent queue', () => {
+    const engine = new PivotEngine(987655, () => undefined);
+    engine.expandCount = 1;
+    engine.flow = buildFlowField(engine.stage, engine.expandCount);
+    engine.flyFlow = buildFlowField(engine.stage, engine.expandCount, true);
+    engine.gateFlows = activeFlowGates(engine.stage, engine.expandCount).map(gate => buildFlowField(engine.stage, engine.expandCount, false, gate));
+    engine.routeSimulation = simulateTraffic(engine.stage, engine.expandCount);
+    engine.items = [{ id: 'brute-passage-icicle', trapId: 'icicle', tier: 1, location: 'board', origin: { x: 4, y: 6 }, cooldowns: [999] }];
+    engine.battle();
+    engine.hp = engine.maxHp = 1_000_000;
+    for (const enemy of engine.enemies) enemy.kind = 'brute';
+    let maxNoProgress = 0;
+    for (let tick = 0; tick < 4_000 && engine.phase === 'combat'; tick++) {
+      (engine as unknown as { updateCombat: (dt: number) => void }).updateCombat(.04);
+      for (const enemy of engine.enemies) if (!enemy.dead && enemy.spawnDelay <= 0) maxNoProgress = Math.max(maxNoProgress, enemy.noProgressTime);
+    }
+    expect(engine.phase).toBe('perk');
+    expect(maxNoProgress).toBeLessThan(5);
   });
 });
