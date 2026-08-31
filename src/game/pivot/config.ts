@@ -44,17 +44,25 @@ export function trapActivationOffsets(def: TrapDef) {
 }
 export const ENEMIES: Record<EnemyKind, EnemyDef> = { grunt: { id: 'grunt', name: 'Grunt', hp: 68, speed: 65, radius: 10, mass: 1, heartDamage: 1, color: 0xe8d9b0, accent: 0xaec5dc }, runner: { id: 'runner', name: 'Runner', hp: 46.75, speed: 85, radius: 8, mass: .7, heartDamage: 1, color: 0xf5e6b6, accent: 0xe76d55 }, flyer: { id: 'flyer', name: 'Flyer', hp: 97.75, speed: 62, radius: 11, mass: .8, heartDamage: 2, color: 0xe7d7bf, accent: 0xb45b8f, flying: true }, shieldbearer: { id: 'shieldbearer', name: 'Shieldbearer', hp: 187, speed: 40, radius: 13, mass: 2.3, heartDamage: 3, color: 0xcabf9d, accent: 0x4e79a7 }, brute: { id: 'brute', name: 'Brute', hp: 340, speed: 35, radius: 18, mass: 4.5, heartDamage: 4, color: 0x938ba1, accent: 0xc6b06b } };
 export const ARCHETYPES = [{ name: 'Crimson Fang Rift', archetype: 'Green Tide', tagline: 'A dense horde. Area damage thrives.', bias: 'grunt' }, { name: 'Well of Slippery Oaths', archetype: 'Slippery Ledge', tagline: 'Fast enemies test every gap.', bias: 'runner' }, { name: 'Iron March Dungeons', archetype: 'Iron March', tagline: 'Armor advances in measured ranks.', bias: 'shieldbearer' }, { name: 'Grotto of Ashen Wings', archetype: 'Winged Cavern', tagline: 'Flying foes test your target selection.', bias: 'flyer' }, { name: 'Four Maws of the Abyss', archetype: 'All-Sides Siege', tagline: 'Threats arrive from every frontier.', bias: 'mixed' }] as const;
-const waveProgress = (wave: number) => Math.max(0, Math.min(1, (wave - 1) / 9));
 
-export function enemyHpScale(wave: number) {
-  const progress = waveProgress(wave);
-  const previousScale = 1 + Math.pow(progress, 1.55) * 2.15;
-  return previousScale * (1 + progress * .25);
-}
+// Designer-owned wave tuning. Change these numbers directly; there is no
+// hidden progression formula behind them.
+export const WAVE_CONFIG = [
+  { wave: 1, enemyCount: 50, specialEnemyCount: 9, enemyHpMultiplier: .6 },
+  { wave: 2, enemyCount: 90, specialEnemyCount: 15, enemyHpMultiplier: .85 },
+  { wave: 3, enemyCount: 150, specialEnemyCount: 23, enemyHpMultiplier: 1.3 },
+  { wave: 4, enemyCount: 200, specialEnemyCount: 33, enemyHpMultiplier: 2.0 },
+  { wave: 5, enemyCount: 250, specialEnemyCount: 45, enemyHpMultiplier: 4.5 },
+  { wave: 6, enemyCount: 300, specialEnemyCount: 59, enemyHpMultiplier: 6.0 },
+  { wave: 7, enemyCount: 400, specialEnemyCount: 75, enemyHpMultiplier: 8.0 },
+  { wave: 8, enemyCount: 500, specialEnemyCount: 94, enemyHpMultiplier: 10.0 },
+  { wave: 9, enemyCount: 750, specialEnemyCount: 115, enemyHpMultiplier: 16.0 },
+  { wave: 10, enemyCount: 1000, specialEnemyCount: 140, enemyHpMultiplier: 20.0 },
+] as const;
 
 export function buildWavePreview(archetype: string, wave: number): Record<EnemyKind, number> {
-  const countScale = 1.2 + waveProgress(wave) * .8;
-  const special = Math.floor((6 + wave * 5) * countScale), total = Math.round((24 + wave * 25) * countScale);
+  const waveConfig = WAVE_CONFIG[wave - 1] ?? WAVE_CONFIG[WAVE_CONFIG.length - 1];
+  const special = waveConfig.specialEnemyCount, total = waveConfig.enemyCount;
   const result: Record<EnemyKind, number> = { grunt: total, runner: 0, flyer: 0, shieldbearer: 0, brute: 0 };
   if (wave < 2) return result;
 

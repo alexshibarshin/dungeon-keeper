@@ -3,7 +3,7 @@ import type { Filter } from 'pixi.js';
 import {
   BOARD_H, BOARD_W, BOARD_X, BOARD_Y, CELL, COLS, CONTROL_TUNING, ENEMIES, EXPAND_PRICES, FLOW_DENSITY_AVOIDANCE, FLOW_LANE_SPREAD, HEIGHT, HEART_HP, PERKS,
   RECYCLER_TARGETS, REROLL_PRICES, ROWS, SHOP_Y, STARTING_COINS, TIER_DAMAGE, TIER_ZONE, TRAPS, TRAP_IDS,
-  WAVE_INCOME, WIDTH, buildWavePreview, enemyHpScale, trapActivationOffsets,
+  WAVE_CONFIG, WAVE_INCOME, WIDTH, buildWavePreview, trapActivationOffsets,
 } from './config';
 import { activeEntrances, activeFlowGates, activeSpawnPoints, buildFlowField, generateDungeon, mulberry32, revealedFloor, revealedMask, simulateTraffic } from './generator';
 import type { TrafficSimulation } from './generator';
@@ -407,7 +407,7 @@ export class PivotEngine {
     const queue: { kind: EnemyKind; entrance: number }[] = [];
     const longest = Math.max(...groups.map(group => group.length));
     for (let row = 0; row < longest; row++) groups.forEach((group, entrance) => { if (group[row]) queue.push({ kind: group[row], entrance }); });
-    const hpScale = enemyHpScale(this.wave);
+    const hpScale = WAVE_CONFIG[this.wave - 1].enemyHpMultiplier;
     queue.forEach(({ kind, entrance }, index) => {
       const def = ENEMIES[kind], point = spawnPoints[entrance] ?? entrances[entrance];
       this.spawnQueue.push({
